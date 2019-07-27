@@ -37,6 +37,10 @@ set BUILD_SPEC=
 set BUILD_ARCH=
 set BUILD_FAILED=
 
+set VSFLAVOR=Professional
+if exist "C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\Common7\IDE\devenv.com" set VSFLAVOR=Community
+echo USING !VSFLAVOR! Visual Studio
+
 rem Parse arguments
 :argloop
 shift /2
@@ -53,6 +57,7 @@ if /I "%ARG%"=="64" set BUILD_ARCH=amd64& goto :argloop
 if /I "%ARG%"=="x64" set BUILD_ARCH=amd64& goto :argloop
 if /I "%ARG%"=="32" set BUILD_ARCH=x86& goto :argloop
 if /I "%ARG%"=="x86" set BUILD_ARCH=x86& goto :argloop
+if /I "%ARG%"=="ARM64" set BUILD_ARCH=ARM64& goto :argloop
 
 rem Assume that this is target OS version and split off the tag
 call :split_target_tag "%ARG%"
@@ -161,14 +166,14 @@ if %BUILD_ARCH%==amd64 set BUILD_ARCH=x64
 set TARGET_VS_CONFIG="%TARGET_PROJ_CONFIG% %BUILD_FLAVOR%|%BUILD_ARCH%"
 
 pushd %BUILD_DIR%
-call "C:\Program Files (x86)\Microsoft Visual Studio 14.0\VC\vcvarsall.bat" x64
+call "%~dp0\SetVsEnv.bat" x86
 
 if /I "!TAG!"=="SDV" (
   echo Running SDV for %BUILD_FILE%, configuration %TARGET_VS_CONFIG%
   call :runsdv "%TARGET_PROJ_CONFIG% %BUILD_FLAVOR%" %BUILD_ARCH%
 ) else (
   echo Building %BUILD_FILE%, configuration %TARGET_VS_CONFIG%, command %BUILD_COMMAND%
-  call %~dp0\callVisualStudio.bat 14 %BUILD_FILE% %BUILD_COMMAND% %TARGET_VS_CONFIG% /Out %BUILD_LOG_FILE%
+  call "C:\Program Files (x86)\Microsoft Visual Studio\2017\!VSFLAVOR!\Common7\IDE\devenv.com" %BUILD_FILE% %BUILD_COMMAND% %TARGET_VS_CONFIG% /Out %BUILD_LOG_FILE%
 )
 popd
 endlocal
@@ -179,6 +184,8 @@ IF ERRORLEVEL 1 (
 goto :eof
 
 :runsdv
+set SDVLEGACY=1
+call "%~dp0\SetVsEnv.bat" x64
 msbuild.exe %BUILD_FILE% /t:clean /p:Configuration="%~1" /P:Platform=%2
 
 IF ERRORLEVEL 1 (
@@ -197,7 +204,7 @@ IF ERRORLEVEL 1 (
   set BUILD_FAILED=1
 )
 
-msbuild.exe %BUILD_FILE% /t:sdv /p:inputs="/devenv /check" /p:Configuration="%~1" /P:platform=%2
+msbuild.exe %BUILD_FILE% /t:sdv /p:inputs="/check /devenv" /p:Configuration="%~1" /P:platform=%2
 
 IF ERRORLEVEL 1 (
   set BUILD_FAILED=1

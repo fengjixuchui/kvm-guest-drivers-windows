@@ -169,7 +169,8 @@ CompleteRequestWithStatus(
 VOID
 FORCEINLINE
 DeviceChangeNotification(
-    IN PVOID DeviceExtension
+    IN PVOID DeviceExtension,
+    IN BOOLEAN bLun
     );
 
 BOOLEAN
@@ -683,6 +684,14 @@ VirtIoHwInitialize(
         guestFeatures |= (1ULL << VIRTIO_BLK_F_MQ);
     }
 
+    if (CHECKBIT(adaptExt->features, VIRTIO_BLK_F_DISCARD)) {
+        guestFeatures |= (1ULL << VIRTIO_BLK_F_DISCARD);
+    }
+
+    if (CHECKBIT(adaptExt->features, VIRTIO_BLK_F_WRITE_ZEROES)) {
+        guestFeatures |= (1ULL << VIRTIO_BLK_F_WRITE_ZEROES);
+    }
+
     if (!NT_SUCCESS(virtio_set_features(&adaptExt->vdev, guestFeatures))) {
         RhelDbgPrint(TRACE_LEVEL_FATAL, " virtio_set_features failed\n");
         return FALSE;
@@ -850,16 +859,24 @@ VirtIoStartIo(
             ULONG SrbPnPFlags;
             ULONG PnPAction;
             SRB_GET_PNP_INFO(Srb, SrbPnPFlags, PnPAction);
-            if ((SrbPnPFlags & SRB_PNP_FLAGS_ADAPTER_REQUEST) == 0) {
-                RhelDbgPrint(TRACE_LEVEL_FATAL, " not SRB_PNP_FLAGS_ADAPTER_REQUEST SrbPnPFlags = %d, PnPAction = %d\n", SrbPnPFlags, PnPAction);
-                if ((PnPAction == StorQueryCapabilities) && (SRB_DATA_TRANSFER_LENGTH(Srb) >= sizeof(STOR_DEVICE_CAPABILITIES))) {
+            RhelDbgPrint(TRACE_LEVEL_FATAL, " SrbPnPFlags = %d, PnPAction = %d\n", SrbPnPFlags, PnPAction);
+            switch (PnPAction) {
+            case StorQueryCapabilities:
+                if (CHECKFLAG(SrbPnPFlags, SRB_PNP_FLAGS_ADAPTER_REQUEST) &&
+                    (SRB_DATA_TRANSFER_LENGTH(Srb) >= sizeof(STOR_DEVICE_CAPABILITIES))) {
                     PSTOR_DEVICE_CAPABILITIES storCapabilities = (PSTOR_DEVICE_CAPABILITIES)SRB_DATA_BUFFER(Srb);
                     RtlZeroMemory(storCapabilities, sizeof(*storCapabilities));
                     storCapabilities->Removable = 1;
                 }
-                else {
-                    SrbStatus = SRB_STATUS_INVALID_REQUEST;
-                }
+                break;
+            case StorRemoveDevice:
+            case StorSurpriseRemoval:
+                adaptExt->removed = TRUE;
+                DeviceChangeNotification(DeviceExtension, FALSE);
+                break;
+            default:
+                RhelDbgPrint(TRACE_LEVEL_FATAL, " Unsupported PnPAction SrbPnPFlags = %d, PnPAction = %d\n", SrbPnPFlags, PnPAction);
+                SrbStatus = SRB_STATUS_INVALID_REQUEST;
             }
             CompleteRequestWithStatus(DeviceExtension, (PSRB_TYPE)Srb, SrbStatus);
             return TRUE;
@@ -896,8 +913,7 @@ VirtIoStartIo(
     }
 
     if (!cdb) {
-        RhelDbgPrint(TRACE_LEVEL_ERROR, " no CDB (%p) Function %x, OperationCode %x\n",
-                    Srb, SRB_FUNCTION(Srb), cdb->CDB6GENERIC.OperationCode);
+        RhelDbgPrint(TRACE_LEVEL_ERROR, " no CDB (%p) Function %x\n", Srb, SRB_FUNCTION(Srb));
         CompleteRequestWithStatus(DeviceExtension, (PSRB_TYPE)Srb, SRB_STATUS_BAD_FUNCTION);
         return TRUE;
     }
@@ -987,6 +1003,16 @@ VirtIoStartIo(
             }
             return TRUE;
         }
+#if (NTDDI_VERSION > NTDDI_WIN7)
+        case SCSIOP_UNMAP: {
+            SRB_SET_SRB_STATUS(Srb, SRB_STATUS_PENDING);
+            if (!RhelDoUnMap(DeviceExtension, (PSRB_TYPE)Srb)) {
+                RhelDbgPrint(TRACE_LEVEL_FATAL, "RhelDoUnMap failed.\n");
+                CompleteRequestWithStatus(DeviceExtension, (PSRB_TYPE)Srb, SRB_STATUS_ERROR);
+            }
+            return TRUE;
+        }
+#endif
     }
 
     if (cdb->CDB12.OperationCode == SCSIOP_REPORT_LUNS) {
@@ -1015,6 +1041,10 @@ VirtIoInterrupt(
     adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
 
     RhelDbgPrint(TRACE_LEVEL_VERBOSE, " IRQL (%d)\n", KeGetCurrentIrql());
+    if (adaptExt->removed == TRUE) {
+        RhelDbgPrint(TRACE_LEVEL_ERROR, " Interrupt on removed device)");
+        return FALSE;
+    }
     intReason = virtio_read_isr_status(&adaptExt->vdev);
     if ( intReason == 1 || adaptExt->dump_mode ) {
         if (!CompleteDPC(DeviceExtension, 1)) {
@@ -1028,7 +1058,7 @@ VirtIoInterrupt(
         adaptExt->sense_info.additionalSenseCode = SCSI_ADSENSE_PARAMETERS_CHANGED;
         adaptExt->sense_info.additionalSenseCodeQualifier = SCSI_SENSEQ_CAPACITY_DATA_CHANGED;
         adaptExt->check_condition = TRUE;
-        DeviceChangeNotification(DeviceExtension);
+        DeviceChangeNotification(DeviceExtension, TRUE);
     }
     if (!isInterruptServiced) {
         RhelDbgPrint(TRACE_LEVEL_ERROR, " was not serviced ISR status = %d\n", intReason);
@@ -1084,7 +1114,9 @@ VirtIoAdapterControl(
     }
     case ScsiStopAdapter: {
         RhelDbgPrint(TRACE_LEVEL_VERBOSE, " ScsiStopAdapter\n");
-        RhelShutDown(DeviceExtension);
+        if (adaptExt->removed == TRUE) {
+            RhelShutDown(DeviceExtension);
+        }
         status = ScsiAdapterControlSuccess;
         break;
     }
@@ -1096,6 +1128,7 @@ VirtIoAdapterControl(
            RhelDbgPrint(TRACE_LEVEL_FATAL, " ScsiRestartAdapter Cannot reinitialize HW\n");
            break;
         }
+        adaptExt->removed = FALSE;
         status = ScsiAdapterControlSuccess;
         break;
     }
@@ -1137,7 +1170,7 @@ VirtIoHwReinitialize(
         adaptExt->sense_info.additionalSenseCodeQualifier = SCSI_ADSENSE_NO_SENSE;
 #endif
         adaptExt->check_condition = TRUE;
-        DeviceChangeNotification(DeviceExtension);
+        DeviceChangeNotification(DeviceExtension, TRUE);
     }
     return TRUE;
 }
@@ -1168,7 +1201,7 @@ VirtIoBuildIo(
 #ifdef DBG
     InterlockedIncrement((LONG volatile*)&adaptExt->srb_cnt);
 #endif
-    if(SRB_PATH_ID(Srb) || SRB_TARGET_ID(Srb) || SRB_LUN(Srb)) {
+    if(SRB_PATH_ID(Srb) || SRB_TARGET_ID(Srb) || SRB_LUN(Srb) || ((adaptExt->removed == TRUE))) {
         CompleteRequestWithStatus(DeviceExtension, (PSRB_TYPE)Srb, SRB_STATUS_NO_DEVICE);
         return FALSE;
     }
@@ -1269,7 +1302,7 @@ VirtIoMSInterruptRoutine (
 {
     PADAPTER_EXTENSION  adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
 
-    if (MessageID > adaptExt->num_queues) {
+    if (MessageID > adaptExt->num_queues || adaptExt->removed == TRUE) {
         RhelDbgPrint(TRACE_LEVEL_ERROR, " MessageID = %d\n", MessageID);
         return FALSE;
     }
@@ -1283,7 +1316,7 @@ VirtIoMSInterruptRoutine (
             adaptExt->sense_info.additionalSenseCode = SCSI_ADSENSE_PARAMETERS_CHANGED;
             adaptExt->sense_info.additionalSenseCodeQualifier = SCSI_SENSEQ_CAPACITY_DATA_CHANGED;
             adaptExt->check_condition = TRUE;
-            DeviceChangeNotification(DeviceExtension);
+            DeviceChangeNotification(DeviceExtension, TRUE);
             return TRUE;
         }
     }
@@ -1336,11 +1369,17 @@ RhelScsiGetInquiryData(
         SupportPages->SupportedPageList[0] = VPD_SUPPORTED_PAGES;
         SupportPages->SupportedPageList[1] = VPD_SERIAL_NUMBER;
         SupportPages->SupportedPageList[2] = VPD_DEVICE_IDENTIFIERS;
+        SupportPages->PageLength = 3;
 #if (NTDDI_VERSION >= NTDDI_WIN7)
         SupportPages->SupportedPageList[3] = VPD_BLOCK_LIMITS;
         SupportPages->PageLength = 4;
-#else
-        SupportPages->PageLength = 3;
+#if (NTDDI_VERSION > NTDDI_WIN7)
+        if (CHECKBIT(adaptExt->features, VIRTIO_BLK_F_DISCARD)) {
+            SupportPages->SupportedPageList[4] = VPD_BLOCK_DEVICE_CHARACTERISTICS;
+            SupportPages->SupportedPageList[5] = VPD_LOGICAL_BLOCK_PROVISIONING;
+            SupportPages->PageLength = 6;
+        }
+#endif
 #endif
         SRB_SET_DATA_TRANSFER_LENGTH(Srb, (sizeof(VPD_SUPPORTED_PAGES_PAGE) + SupportPages->PageLength));
     }
@@ -1401,13 +1440,63 @@ RhelScsiGetInquiryData(
         LimitsPage->DeviceType = DIRECT_ACCESS_DEVICE;
         LimitsPage->DeviceTypeQualifier = DEVICE_CONNECTED;
         LimitsPage->PageCode = VPD_BLOCK_LIMITS;
-        REVERSE_BYTES_SHORT(&LimitsPage->PageLength, &pageLen);
         REVERSE_BYTES_SHORT(&LimitsPage->OptimalTransferLengthGranularity, &adaptExt->info.min_io_size);
         REVERSE_BYTES(&LimitsPage->MaximumTransferLength, &max_io_size);
         REVERSE_BYTES(&LimitsPage->OptimalTransferLength, &adaptExt->info.opt_io_size);
-
+#if (NTDDI_VERSION > NTDDI_WIN7)
+        if ((CHECKBIT(adaptExt->features, VIRTIO_BLK_F_DISCARD)) &&
+            (dataLen >= 0x14)) {
+            ULONG opt_unmap_granularity = 8;
+            pageLen = 0x3c;
+            REVERSE_BYTES(&LimitsPage->MaximumUnmapLBACount, &adaptExt->info.max_discard_sectors);
+            REVERSE_BYTES(&LimitsPage->MaximumUnmapBlockDescriptorCount, &adaptExt->info.max_discard_seg);
+            REVERSE_BYTES(&LimitsPage->OptimalUnmapGranularity, &opt_unmap_granularity);
+            REVERSE_BYTES(&LimitsPage->UnmapGranularityAlignment, &adaptExt->info.discard_sector_alignment);
+            LimitsPage->UGAValid = adaptExt->info.discard_sector_alignment ? 1 : 0;
+        }
+#endif
+        REVERSE_BYTES_SHORT(&LimitsPage->PageLength, &pageLen);
         SRB_SET_DATA_TRANSFER_LENGTH(Srb, (FIELD_OFFSET(VPD_BLOCK_LIMITS_PAGE, Reserved0) + pageLen));
     }
+
+#if (NTDDI_VERSION > NTDDI_WIN7)
+    else if ((cdb->CDB6INQUIRY3.PageCode == VPD_BLOCK_DEVICE_CHARACTERISTICS) &&
+             (cdb->CDB6INQUIRY3.EnableVitalProductData == 1) &&
+             (dataLen >= 0x08)) {
+
+        PVPD_BLOCK_DEVICE_CHARACTERISTICS_PAGE CharacteristicsPage;
+
+        CharacteristicsPage = (PVPD_BLOCK_DEVICE_CHARACTERISTICS_PAGE)SRB_DATA_BUFFER(Srb);
+        CharacteristicsPage->DeviceType = DIRECT_ACCESS_DEVICE;
+        CharacteristicsPage->DeviceTypeQualifier = DEVICE_CONNECTED;
+        CharacteristicsPage->PageCode = VPD_BLOCK_DEVICE_CHARACTERISTICS;
+        CharacteristicsPage->PageLength = 0x3C;
+        CharacteristicsPage->MediumRotationRateMsb = 0;
+        CharacteristicsPage->MediumRotationRateLsb = 0;
+        CharacteristicsPage->NominalFormFactor = 0;
+    }
+    else if ((cdb->CDB6INQUIRY3.PageCode == VPD_LOGICAL_BLOCK_PROVISIONING) &&
+             (cdb->CDB6INQUIRY3.EnableVitalProductData == 1) &&
+             (dataLen >= 0x08)) {
+
+        PVPD_LOGICAL_BLOCK_PROVISIONING_PAGE ProvisioningPage;
+        USHORT pageLen = 0x04;
+
+        ProvisioningPage = (PVPD_LOGICAL_BLOCK_PROVISIONING_PAGE)SRB_DATA_BUFFER(Srb);
+        ProvisioningPage->DeviceType = DIRECT_ACCESS_DEVICE;
+        ProvisioningPage->DeviceTypeQualifier = DEVICE_CONNECTED;
+        ProvisioningPage->PageCode = VPD_LOGICAL_BLOCK_PROVISIONING;
+        REVERSE_BYTES_SHORT(&ProvisioningPage->PageLength, &pageLen);
+
+        ProvisioningPage->DP = 0;
+        ProvisioningPage->LBPRZ = 0;
+        ProvisioningPage->LBPWS10 = 0;
+        ProvisioningPage->LBPWS = 0;
+        ProvisioningPage->LBPU = CHECKBIT(adaptExt->features, VIRTIO_BLK_F_DISCARD) ? 1 : 0;
+        ProvisioningPage->ProvisioningType = CHECKBIT(adaptExt->features, VIRTIO_BLK_F_DISCARD) ? PROVISIONING_TYPE_THIN : PROVISIONING_TYPE_RESOURCE;
+    }
+
+#endif
 #endif
     else if (dataLen > sizeof(INQUIRYDATA)) {
         StorPortMoveMemory(InquiryData, &adaptExt->inquiry_data, sizeof(INQUIRYDATA));
@@ -1625,6 +1714,8 @@ RhelScsiGetCapacity(
         if (srbdatalen >= (ULONG)FIELD_OFFSET(READ_CAPACITY16_DATA, Reserved3)) {
             readCapEx->LogicalPerPhysicalExponent = adaptExt->info.physical_block_exp;
             srbdatalen = FIELD_OFFSET(READ_CAPACITY16_DATA, Reserved3);
+            readCapEx->LBPME = CHECKBIT(adaptExt->features, VIRTIO_BLK_F_DISCARD) ? 1 : 0;
+            readCapEx->LBPRZ = 0;
             SRB_SET_DATA_TRANSFER_LENGTH(Srb, FIELD_OFFSET(READ_CAPACITY16_DATA, Reserved3));
         }
 #endif
@@ -1707,18 +1798,20 @@ CompleteRequestWithStatus(
 VOID
 FORCEINLINE
 DeviceChangeNotification(
-    IN PVOID DeviceExtension
+    IN PVOID DeviceExtension,
+    IN BOOLEAN bLun
 )
 {
     PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
 #if (NTDDI_VERSION > NTDDI_WIN7)
     StorPortStateChangeDetected(DeviceExtension,
-                                STATE_CHANGE_LUN,
+                                bLun ? STATE_CHANGE_LUN : STATE_CHANGE_BUS,
                                 (PSTOR_ADDRESS)&adaptExt->device_address,
                                 0,
                                 NULL,
                                 NULL);
 #else
+    bLun;
     StorPortNotification( BusChangeDetected, DeviceExtension, 0);
 #endif
      RhelDbgPrint(TRACE_LEVEL_FATAL, " StorPortStateChangeDetected.\n");

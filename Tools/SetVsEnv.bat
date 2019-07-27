@@ -1,26 +1,14 @@
 @echo off
-REM Set NATIVE ENV for running SDV Tool.
-set vsVer=%1
-set arc=%2
+if not "%VSFLAVOR%"=="" goto :knownVS
+call :checkvs
+echo USING %VSFLAVOR% Visual Studio
 
-set query='reg query "HKLM\Software\Microsoft\VisualStudio\%vsVer%.0" /v ShellFolder'
-for /F "tokens=2*" %%A in (%query%) do (
-set env=%%B
-if not "%%B"=="" GOTO SET
-)
+:knownVS
+echo %0: Setting NATIVE ENV for %1 (VS %VSFLAVOR%)...
+call "C:\Program Files (x86)\Microsoft Visual Studio\2017\%VSFLAVOR%\VC\Auxiliary\Build\vcvarsall.bat" %1
+goto :eof
 
-set query='reg query "HKLM\Software\Wow6432Node\Microsoft\VisualStudio\%vsVer%.0" /v ShellFolder'
-
-for /F "tokens=2*" %%A in (%query%) do (
-set env=%%B
-if not "%%B"=="" GOTO SET
-)
-ECHO ERROR Couldn't find VisualStudio installation.
-exit /B 1
-
-:SET
-set cmdEnv="%env%VC\vcvarsall.bat"
-call %cmdEnv% %arc%
-
-
-
+:checkvs
+set VSFLAVOR=Professional
+if exist "C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\VC\Auxiliary\Build\vcvarsall.bat" set VSFLAVOR=Community
+goto :eof
