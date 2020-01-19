@@ -1,6 +1,7 @@
 /*
- * Public include file
+ * This file contains various logger routines
  *
+ * Copyright (c) 2010-2019 Red Hat, Inc.
  * Copyright (c) 2019 Virtuozzo International GmbH
  *
  * Redistribution and use in source and binary forms, with or without
@@ -26,33 +27,40 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
-#if !defined(PUBLIC_H)
-#define PUBLIC_H
+#include "precomp.h"
 
-#define  VIOSOCK_NAME L"\\??\\Viosock"
-#define  VIOSOCK_SYMLINK_NAME L"\\DosDevices\\Viosock"
+#if defined(EVENT_TRACING)
+#include "utils.tmh"
+#endif
 
- // {6B58DC1F-01C3-440F-BE1C-B95D000F1FF5}
-DEFINE_GUID(GUID_DEVINTERFACE_VIOSOCK,
-    0x6b58dc1f, 0x1c3, 0x440f, 0xbe, 0x1c, 0xb9, 0x5d, 0x0, 0xf, 0x1f, 0xf5);
+// Global debug printout level and enable\disable flag
+BOOL g_bDebugPrint;
+int g_DebugLevel;
+ULONG g_DebugFlags;
 
-#define IOCTL_GET_CONFIG        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_READ_ACCESS)
+#if !defined(EVENT_TRACING)
 
-typedef struct _VIRTIO_VSOCK_CONFIG {
-    ULONG64 guest_cid;
-}VIRTIO_VSOCK_CONFIG, *PVIRTIO_VSOCK_CONFIG;
+#define     TEMP_BUFFER_SIZE        256
 
-#define VIRTIO_VSOCK_HOST_CID   2
+void DebugPrintProc(const char *format, ...)
+{
+    char buf[256];
+    va_list list;
+    va_start(list, format);
+    if (StringCbVPrintfA(buf, sizeof(buf), format, list) == S_OK)
+    {
+        OutputDebugStringA(buf);
+    }
+    va_end(list);
+}
+#endif
 
-// typedef enum _VIRTIO_VSOCK_EA_TYPE
-// {
-//     VSOCK_TYPE_NEW=0,
-//     VSOCK_TYPE_ACCEPT=1,
-//     VSOCK_TYPE_INVALID
-// }VIRTIO_VSOCK_EA_TYPE;
+void InitDebugPrints()
+{
+    WPP_INIT_TRACING(NULL);
+    //TODO - Read nDebugLevel and bDebugPrint from the registry
+    g_DebugFlags = 0xffffffff;
 
-typedef struct _VIRTIO_VSOCK_PARAMS {
-    ULONGLONG Socket;
-}VIRTIO_VSOCK_PARAMS, *PVIRTIO_VSOCK_PARAMS;
-
-#endif /* PUBLIC_H */
+    g_bDebugPrint = 1;
+    g_DebugLevel = TRACE_LEVEL_INFORMATION;
+}
