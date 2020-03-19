@@ -1,6 +1,10 @@
-//#include <basetyps.h>
+#include "speed-test.h"
+
+#ifndef linux
+
 #include "device.h"
 #include "assert.h"
+
 
 #pragma warning(default:4201)
 
@@ -206,12 +210,22 @@ wmain(
     BOOLEAN stoptest = FALSE;
     BOOLEAN ovrl = TRUE;
     UINT ifIndex = 0;
+    int speedTest = 0;
 
     if(argc == 2)
     {
-        if (_wcsicmp(L"-n", argv[1]) == 0) {
+        if (_wcsicmp(L"-sp", argv[1]) == 0) {
+            speedTest = 1;
+        }
+        else if (_wcsicmp(L"-n", argv[1]) == 0) {
            ovrl = FALSE;
         }
+    }
+
+    if (speedTest)
+    {
+        speed_test(true);
+        return 0;
     }
 
     if (ovrl)
@@ -288,3 +302,13 @@ wmain(
     delete m_pDev;
     return 0;
 }
+
+#else
+
+int main()
+{
+    speed_test(false);
+    return 0;
+}
+
+#endif
