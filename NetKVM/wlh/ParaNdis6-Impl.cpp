@@ -85,7 +85,7 @@ NDIS_HANDLE ParaNdis_OpenNICConfiguration(PARANDIS_ADAPTER *pContext)
     DEBUG_ENTRY(2);
     co.Header.Type = NDIS_OBJECT_TYPE_CONFIGURATION_OBJECT;
     co.Header.Revision = NDIS_CONFIGURATION_OBJECT_REVISION_1;
-    co.Header.Size = sizeof(co);
+    co.Header.Size = NDIS_SIZEOF_CONFIGURATION_OBJECT_REVISION_1;
     co.Flags = 0;
     co.NdisHandle = pContext->MiniportHandle;
     status = NdisOpenConfigurationEx(&co, &cfg);
@@ -649,7 +649,7 @@ NDIS_STATUS ParaNdis_FinishSpecificInitialization(PARANDIS_ADAPTER *pContext)
         mic.MessageInterruptDpcHandler = MiniportMSIInterruptDpc;
     }
     PoolParams.Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
-    PoolParams.Header.Size = sizeof(PoolParams);
+    PoolParams.Header.Size = NDIS_SIZEOF_NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
     PoolParams.Header.Revision = NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
     PoolParams.ProtocolId = NDIS_PROTOCOL_ID_DEFAULT;
     PoolParams.fAllocateNetBuffer = TRUE;
@@ -695,7 +695,7 @@ NDIS_STATUS ParaNdis_FinishSpecificInitialization(PARANDIS_ADAPTER *pContext)
         NDIS_SG_DMA_DESCRIPTION sgDesc;
         sgDesc.Header.Type = NDIS_OBJECT_TYPE_SG_DMA_DESCRIPTION;
         sgDesc.Header.Revision = NDIS_SG_DMA_DESCRIPTION_REVISION_1;
-        sgDesc.Header.Size = sizeof(sgDesc);
+        sgDesc.Header.Size = NDIS_SIZEOF_SG_DMA_DESCRIPTION_REVISION_1;
         sgDesc.Flags = NDIS_SG_DMA_64_BIT_ADDRESS;
         sgDesc.MaximumPhysicalMapping = 0x10000; // 64K
         sgDesc.ProcessSGListHandler = ProcessSGListHandler;
@@ -783,8 +783,31 @@ void ParaNdis_AdjustRxBufferHolderLength(
     NETKVM_ASSERT(ulBytesLeft == 0);
 }
 
+#if PARANDIS_SUPPORT_RSS
+static ULONG HashReportToHashType(USHORT report)
+{
+    static const ULONG table[VIRTIO_NET_HASH_REPORT_MAX + 1] =
+    {
+#if (NDIS_SUPPORT_NDIS680)
+        0, NDIS_HASH_IPV4, NDIS_HASH_TCP_IPV4, NDIS_HASH_UDP_IPV4,
+        NDIS_HASH_IPV6, NDIS_HASH_TCP_IPV6, NDIS_HASH_UDP_IPV6,
+        NDIS_HASH_IPV6_EX, NDIS_HASH_TCP_IPV6_EX, NDIS_HASH_UDP_IPV6_EX
+#else
+        0, NDIS_HASH_IPV4, NDIS_HASH_TCP_IPV4, 0,
+        NDIS_HASH_IPV6, NDIS_HASH_TCP_IPV6, 0,
+        NDIS_HASH_IPV6_EX, NDIS_HASH_TCP_IPV6_EX, 0
+#endif
+    };
+    if (report > VIRTIO_NET_HASH_REPORT_MAX)
+    {
+        return 0;
+    }
+    return table[report];
+}
+#endif
+
 static __inline
-VOID NBLSetRSSInfo(PPARANDIS_ADAPTER pContext, PNET_BUFFER_LIST pNBL, PNET_PACKET_INFO PacketInfo)
+VOID NBLSetRSSInfo(PPARANDIS_ADAPTER pContext, PNET_BUFFER_LIST pNBL, PNET_PACKET_INFO PacketInfo, PVOID virtioHeader)
 {
 #if PARANDIS_SUPPORT_RSS
     CNdisRWLockState lockState;
@@ -795,12 +818,25 @@ VOID NBLSetRSSInfo(PPARANDIS_ADAPTER pContext, PNET_BUFFER_LIST pNBL, PNET_PACKE
         NET_BUFFER_LIST_SET_HASH_TYPE    (pNBL, PacketInfo->RSSHash.Type);
         NET_BUFFER_LIST_SET_HASH_FUNCTION(pNBL, PacketInfo->RSSHash.Function);
         NET_BUFFER_LIST_SET_HASH_VALUE   (pNBL, PacketInfo->RSSHash.Value);
+        if (PacketInfo->RSSHash.Type && pContext->bHashReportedByDevice)
+        {
+            virtio_net_hdr_v1_hash *ph = (virtio_net_hdr_v1_hash *)virtioHeader;
+            ULONG val = HashReportToHashType(ph->hash_report);
+            if (val != PacketInfo->RSSHash.Type || ph->hash_value != PacketInfo->RSSHash.Value)
+            {
+                pContext->extraStatistics.framesRSSError++;
+                TraceNoPrefix(0, "%s: hash mistake: reported %d, correct %X\n", __FUNCTION__,
+                    ph->hash_report, PacketInfo->RSSHash.Type);
+            }
+        }
+
     }
     pContext->RSSParameters.rwLock.releaseDpr(lockState);
 #else
     UNREFERENCED_PARAMETER(pContext);
     UNREFERENCED_PARAMETER(pNBL);
     UNREFERENCED_PARAMETER(PacketInfo);
+    UNREFERENCED_PARAMETER(virtioHeader);
 #endif
 }
 
@@ -955,7 +991,7 @@ tPacketIndicationType ParaNdis_PrepareReceivedPacket(
             NDIS_TCP_IP_CHECKSUM_NET_BUFFER_LIST_INFO qCSInfo;
             qCSInfo.Value = NULL;
             pNBL->SourceHandle = pContext->MiniportHandle;
-            NBLSetRSSInfo(pContext, pNBL, pPacketInfo);
+            NBLSetRSSInfo(pContext, pNBL, pPacketInfo, pHeader);
             NBLSet8021QInfo(pContext, pNBL, pPacketInfo);
 
             pNBL->MiniportReserved[0] = pBuffersDesc;

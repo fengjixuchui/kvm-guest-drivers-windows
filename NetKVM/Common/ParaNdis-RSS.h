@@ -38,10 +38,15 @@ typedef struct _tagPARANDIS_SCALING_SETTINGS
     ULONG          CPUIndexMappingSize;
 
     LONG           FirstQueueIndirectionIndex;
+
+    PROCESSOR_NUMBER DefaultProcessor;
+    CCHAR          DefaultQueue;
 } PARANDIS_SCALING_SETTINGS, *PPARANDIS_SCALING_SETTINGS;
 
 typedef struct _tagPARANDIS_RSS_PARAMS
 {
+    PARANDIS_ADAPTER *pContext;
+
     CCHAR             ReceiveQueuesNumber;
 
     PARANDIS_RSS_MODE RSSMode;
@@ -74,11 +79,13 @@ NDIS_STATUS ParaNdis6_RSSSetReceiveHash(PARANDIS_ADAPTER *pContext,
                                         UINT ParamsLength,
                                         PUINT ParamsBytesRead);
 
+void ParaNdis6_CheckDeviceRSSCapabilities(PARANDIS_ADAPTER *pContext, bool& bRss, bool& bHash);
+/* for engineering tests only */
+void ParaNdis6_EnableDeviceRssSupport(PARANDIS_ADAPTER *pContext, BOOLEAN b);
+
 VOID ParaNdis6_RSSCleanupConfiguration(PARANDIS_RSS_PARAMS *RSSParameters);
 
-NDIS_RECEIVE_SCALE_CAPABILITIES* ParaNdis6_RSSCreateConfiguration(PARANDIS_RSS_PARAMS *RSSParameters,
-                                                                  NDIS_RECEIVE_SCALE_CAPABILITIES *RSSCapabilities,
-                                                                  CCHAR RSSMaxQueuesNumber);
+NDIS_RECEIVE_SCALE_CAPABILITIES* ParaNdis6_RSSCreateConfiguration(PARANDIS_ADAPTER *pContext);
 
 struct _tagNET_PACKET_INFO;
 

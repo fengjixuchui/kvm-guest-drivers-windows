@@ -88,6 +88,24 @@ extern "C"
 #define NETKVM_COPY_RX_DATA
 #endif
 
+typedef struct _tagRunTimeNdisVersion
+{
+    UCHAR major;
+    UCHAR minor;
+}tRunTimeNdisVersion;
+
+extern const tRunTimeNdisVersion& ParandisVersion;
+
+/* true if NDIS version is at least major.minor */
+static bool FORCEINLINE CheckNdisVersion(UCHAR major, UCHAR minor)
+{
+    if (ParandisVersion.major == major)
+    {
+        return ParandisVersion.minor >= minor;
+    }
+    return ParandisVersion.major > major;
+}
+
 typedef struct _tagPARANDIS_ADAPTER PARANDIS_ADAPTER;
 
 #include "ParaNdis-SM.h"
@@ -382,6 +400,7 @@ typedef struct _tagPARANDIS_ADAPTER
     u64                     u64GuestFeatures;
     BOOLEAN                 bConnected;
     BOOLEAN                 bGuestAnnounced;
+    NDIS_PHYSICAL_MEDIUM    physicalMediaType;
     NDIS_MEDIA_CONNECT_STATE fCurrentLinkState;
     BOOLEAN                 bEnableInterruptHandlingDPC;
     BOOLEAN                 bDoSupportPriority;
@@ -437,6 +456,10 @@ typedef struct _tagPARANDIS_ADAPTER
         ULONG framesFilteredOut;
         ULONG framesCoalescedHost;
         ULONG framesCoalescedWindows;
+        ULONG framesRSSHits;
+        ULONG framesRSSMisses;
+        ULONG framesRSSUnclassified;
+        ULONG framesRSSError;
     } extraStatistics;
 
     /* initial number of free Tx descriptor(from cfg) - max number of available Tx descriptors */
@@ -476,6 +499,9 @@ typedef struct _tagPARANDIS_ADAPTER
     BOOLEAN                     bOffloadv4Enabled;
     BOOLEAN                     bOffloadv6Enabled;
     BOOLEAN                     bDeviceInitialized;
+    BOOLEAN                     bRSSSupportedByDevice;
+    BOOLEAN                     bRSSSupportedByDevicePersistent;
+    BOOLEAN                     bHashReportedByDevice;
 
 #if PARANDIS_SUPPORT_RSS
     BOOLEAN                     bRSSOffloadSupported;
@@ -483,6 +509,12 @@ typedef struct _tagPARANDIS_ADAPTER
     NDIS_RECEIVE_SCALE_CAPABILITIES RSSCapabilities;
     PARANDIS_RSS_PARAMS         RSSParameters;
     CCHAR                       RSSMaxQueuesNumber;
+    struct
+    {
+        ULONG                   SupportedHashes;
+        USHORT                  MaxIndirectEntries;
+        UCHAR                   MaxKeySize;
+    } DeviceRSSCapabilities;
 #endif
 
 #if PARANDIS_SUPPORT_RSC
@@ -600,12 +632,8 @@ VOID ParaNdis_PowerOff(
     PARANDIS_ADAPTER *pContext
 );
 
-#if PARANDIS_SUPPORT_RSC
-VOID ParaNdis_UpdateGuestOffloads(
-    PARANDIS_ADAPTER *pContext,
-    UINT64 Offloads
-);
-#endif
+void ParaNdis_DeviceConfigureRSC(PARANDIS_ADAPTER *pContext);
+
 void ParaNdis_ResetOffloadSettings(PARANDIS_ADAPTER *pContext, tOffloadSettingsFlags *pDest, PULONG from);
 
 tChecksumCheckResult ParaNdis_CheckRxChecksum(

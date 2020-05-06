@@ -298,6 +298,85 @@ static FORCEINLINE BOOLEAN ParaNdis_PerformPacketAnalysis(
     return TRUE;
 }
 
+#define LogRedirectedPacket(p)
+#if !defined(LogRedirectedPacket)
+static void LogRedirectedPacket(pRxNetDescriptor pBufferDescriptor)
+{
+    NET_PACKET_INFO *pi = &pBufferDescriptor->PacketInfo;
+    LPCSTR packetType = "Unknown";
+    IPv4Header *pIp4Header = NULL;
+    TCPHeader  *pTcpHeader = NULL;
+    UDPHeader  *pUdpHeader = NULL;
+    //IPv6Header *pIp6Header = NULL;
+    switch (pi->RSSHash.Type)
+    {
+    case NDIS_HASH_TCP_IPV4:
+        packetType = "TCP_IPV4";
+        pIp4Header = (IPv4Header *)RtlOffsetToPointer(pi->headersBuffer, pi->L2HdrLen);
+        pTcpHeader = (TCPHeader *)RtlOffsetToPointer(pIp4Header, pi->L3HdrLen);
+        break;
+    case NDIS_HASH_IPV4:
+        packetType = "IPV4";
+        pIp4Header = (IPv4Header *)RtlOffsetToPointer(pi->headersBuffer, pi->L2HdrLen);
+        break;
+    case NDIS_HASH_TCP_IPV6:
+        packetType = "TCP_IPV6";
+        break;
+    case NDIS_HASH_TCP_IPV6_EX:
+        packetType = "TCP_IPV6EX";
+        break;
+    case NDIS_HASH_IPV6_EX:
+        packetType = "TCP_IPV6EX";
+        break;
+    case NDIS_HASH_IPV6:
+        packetType = "TCP_IPV6";
+        break;
+#if (NDIS_SUPPORT_NDIS680)
+    case NDIS_HASH_UDP_IPV4:
+        packetType = "UDP_IPV4";
+        pIp4Header = (IPv4Header *)RtlOffsetToPointer(pi->headersBuffer, pi->L2HdrLen);
+        pUdpHeader = (UDPHeader *)RtlOffsetToPointer(pIp4Header, pi->L3HdrLen);
+        break;
+    case NDIS_HASH_UDP_IPV6:
+        packetType = "UDP_IPV6";
+        break;
+    case NDIS_HASH_UDP_IPV6_EX:
+        packetType = "UDP_IPV6EX";
+        break;
+#endif
+    default:
+        break;
+    }
+    if (pTcpHeader)
+    {
+        TraceNoPrefix(0, "%s: %s %d.%d.%d.%d:%d->%d.%d.%d.%d:%d\n", __FUNCTION__, packetType,
+            pIp4Header->ip_srca[0], pIp4Header->ip_srca[1], pIp4Header->ip_srca[2], pIp4Header->ip_srca[3],
+            RtlUshortByteSwap(pTcpHeader->tcp_src),
+            pIp4Header->ip_desta[0], pIp4Header->ip_desta[1], pIp4Header->ip_desta[2], pIp4Header->ip_desta[3],
+            RtlUshortByteSwap(pTcpHeader->tcp_dest));
+    }
+    else if (pUdpHeader)
+    {
+        TraceNoPrefix(0, "%s: %s %d.%d.%d.%d:%d->%d.%d.%d.%d:%d\n", __FUNCTION__, packetType,
+            pIp4Header->ip_srca[0], pIp4Header->ip_srca[1], pIp4Header->ip_srca[2], pIp4Header->ip_srca[3],
+            RtlUshortByteSwap(pUdpHeader->udp_src),
+            pIp4Header->ip_desta[0], pIp4Header->ip_desta[1], pIp4Header->ip_desta[2], pIp4Header->ip_desta[3],
+            RtlUshortByteSwap(pUdpHeader->udp_dest));
+    }
+    else if (pIp4Header)
+    {
+        TraceNoPrefix(0, "%s: %s %d.%d.%d.%d(%d)->%d.%d.%d.%d\n", __FUNCTION__, packetType,
+            pIp4Header->ip_srca[0], pIp4Header->ip_srca[1], pIp4Header->ip_srca[2], pIp4Header->ip_srca[3],
+            pIp4Header->ip_protocol,
+            pIp4Header->ip_desta[0], pIp4Header->ip_desta[1], pIp4Header->ip_desta[2], pIp4Header->ip_desta[3]);
+    }
+    else
+    {
+        TraceNoPrefix(0, "%s: %s\n", __FUNCTION__, packetType);
+    }
+}
+#endif
+
 VOID CParaNdisRX::ProcessRxRing(CCHAR nCurrCpuReceiveQueue)
 {
     pRxNetDescriptor pBufferDescriptor;
@@ -347,6 +426,7 @@ VOID CParaNdisRX::ProcessRxRing(CCHAR nCurrCpuReceiveQueue)
         if (nTargetReceiveQueueNum == PARANDIS_RECEIVE_UNCLASSIFIED_PACKET)
         {
             ParaNdis_ReceiveQueueAddBuffer(&m_UnclassifiedPacketsQueue, pBufferDescriptor);
+            m_Context->extraStatistics.framesRSSUnclassified++;
         }
         else
         {
@@ -356,6 +436,12 @@ VOID CParaNdisRX::ProcessRxRing(CCHAR nCurrCpuReceiveQueue)
             {
                 ParaNdis_ProcessorNumberToGroupAffinity(&TargetAffinity, &TargetProcessor);
                 ParaNdis_QueueRSSDpc(m_Context, m_messageIndex, &TargetAffinity);
+                m_Context->extraStatistics.framesRSSMisses++;
+                LogRedirectedPacket(pBufferDescriptor);
+            }
+            else
+            {
+                m_Context->extraStatistics.framesRSSHits++;
             }
         }
 #else

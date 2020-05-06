@@ -73,6 +73,7 @@ typedef struct _tagConfigurationEntry
 
 typedef struct _tagConfigurationEntries
 {
+    tConfigurationEntry PhysicalMediaType;
     tConfigurationEntry PrioritySupport;
     tConfigurationEntry isLogEnabled;
     tConfigurationEntry debugLevel;
@@ -105,6 +106,7 @@ typedef struct _tagConfigurationEntries
 
 static const tConfigurationEntries defaultConfiguration =
 {
+    { "*PhysicalMediaType", 0,  0,  0xff },
     { "Priority",       0,  0,  1 },
     { "DoLog",          1,  0,  1 },
     { "DebugLevel",     2,  0,  8 },
@@ -233,6 +235,7 @@ static void ReadNicConfiguration(PARANDIS_ADAPTER *pContext, PUCHAR pNewMACAddre
         cfg = ParaNdis_OpenNICConfiguration(pContext);
         if (cfg)
         {
+            GetConfigurationEntry(cfg, &pConfiguration->PhysicalMediaType);
             GetConfigurationEntry(cfg, &pConfiguration->isLogEnabled);
             GetConfigurationEntry(cfg, &pConfiguration->debugLevel);
             GetConfigurationEntry(cfg, &pConfiguration->PrioritySupport);
@@ -264,6 +267,7 @@ static void ReadNicConfiguration(PARANDIS_ADAPTER *pContext, PUCHAR pNewMACAddre
 
             bDebugPrint = pConfiguration->isLogEnabled.ulValue;
             virtioDebugLevel = pConfiguration->debugLevel.ulValue;
+            pContext->physicalMediaType = (NDIS_PHYSICAL_MEDIUM)pConfiguration->PhysicalMediaType.ulValue;
             pContext->maxFreeTxDescriptors = pConfiguration->TxCapacity.ulValue;
             pContext->NetMaxReceiveBuffers = pConfiguration->RxCapacity.ulValue;
             pContext->uNumberOfHandledRXPacketsInDPC = pConfiguration->NumberOfHandledRXPacketsInDPC.ulValue;
@@ -404,6 +408,8 @@ static void DumpVirtIOFeatures(PPARANDIS_ADAPTER pContext)
         {VIRTIO_F_RING_PACKED, "VIRTIO_F_RING_PACKED"},
         {VIRTIO_NET_F_CTRL_GUEST_OFFLOADS, "VIRTIO_NET_F_CTRL_GUEST_OFFLOADS" },
         {VIRTIO_NET_F_RSC_EXT, "VIRTIO_NET_F_RSC_EXT" },
+        {VIRTIO_NET_F_RSS, "VIRTIO_NET_F_RSS" },
+        {VIRTIO_NET_F_HASH_REPORT, "VIRTIO_NET_F_HASH_REPORT" },
     };
     UINT i;
     for (i = 0; i < sizeof(Features)/sizeof(Features[0]); ++i)
@@ -811,6 +817,33 @@ NDIS_STATUS ParaNdis_InitializeContext(
 
 #if PARANDIS_SUPPORT_RSS
     pContext->bMultiQueue = pContext->bControlQueueSupported && AckFeature(pContext, VIRTIO_NET_F_MQ);
+    bool bRSS = virtio_is_feature_enabled(pContext->u64HostFeatures, VIRTIO_NET_F_RSS);
+    bool bHash = virtio_is_feature_enabled(pContext->u64HostFeatures, VIRTIO_NET_F_HASH_REPORT);
+
+    if ((bHash || bRSS) && pContext->bControlQueueSupported && virtio_is_feature_enabled(pContext->u64HostFeatures, VIRTIO_F_VERSION_1))
+    {
+        struct virtio_net_config cfg = {};
+        virtio_get_config(&pContext->IODevice, FIELD_OFFSET(struct virtio_net_config, duplex), &cfg.duplex, 8);
+        pContext->DeviceRSSCapabilities.SupportedHashes = cfg.supported_hash_types;
+        pContext->DeviceRSSCapabilities.MaxKeySize = cfg.rss_max_key_size;
+        pContext->DeviceRSSCapabilities.MaxIndirectEntries = cfg.rss_max_indirection_table_length;
+
+        ParaNdis6_CheckDeviceRSSCapabilities(pContext, bRSS, bHash);
+
+        if (bRSS)
+        {
+            pContext->bRSSSupportedByDevice = AckFeature(pContext, VIRTIO_NET_F_RSS);
+            pContext->bRSSSupportedByDevicePersistent = pContext->bRSSSupportedByDevice;
+        }
+        if (bHash)
+        {
+            pContext->bHashReportedByDevice = AckFeature(pContext, VIRTIO_NET_F_HASH_REPORT);
+        }
+    }
+    if (pContext->bRSSSupportedByDevice)
+    {
+        pContext->bMultiQueue = true;
+    }
     if (pContext->bMultiQueue)
     {
         virtio_get_config(&pContext->IODevice, ETH_ALEN + sizeof(USHORT), &pContext->nHardwareQueues,
@@ -855,7 +888,9 @@ NDIS_STATUS ParaNdis_InitializeContext(
     pContext->bAnyLayout = AckFeature(pContext, VIRTIO_F_ANY_LAYOUT);
     if (AckFeature(pContext, VIRTIO_F_VERSION_1))
     {
-        pContext->nVirtioHeaderSize = sizeof(virtio_net_hdr_v1);
+        pContext->nVirtioHeaderSize = pContext->bHashReportedByDevice ?
+            sizeof(virtio_net_hdr_v1_hash) : sizeof(virtio_net_hdr_v1);
+
         pContext->bAnyLayout = true;
         DPrintf(0, "[%s] Assuming VIRTIO_F_ANY_LAYOUT for V1 device\n", __FUNCTION__);
         if (AckFeature(pContext, VIRTIO_F_RING_PACKED))
@@ -1105,12 +1140,39 @@ void ParaNdis_DeviceConfigureRSC(PARANDIS_ADAPTER *pContext)
         ((pContext->RSC.bIPv6Enabled) ? (1 << VIRTIO_NET_F_GUEST_TSO6) : 0) |
         ((pContext->RSC.bQemuSupported) ? (1LL << VIRTIO_NET_F_RSC_EXT) : 0);
 
-    DPrintf(0, "Updating offload settings with %I64x", GuestOffloads);
-
-    ParaNdis_UpdateGuestOffloads(pContext, GuestOffloads);
+    if (pContext->RSC.bHasDynamicConfig)
+    {
+        DPrintf(0, "Updating offload settings with %I64x\n", GuestOffloads);
+        pContext->CXPath.SendControlMessage(VIRTIO_NET_CTRL_GUEST_OFFLOADS, VIRTIO_NET_CTRL_GUEST_OFFLOADS_SET,
+            &GuestOffloads,
+            sizeof(GuestOffloads),
+            NULL, 0, 2);
+    }
+    else
+    {
+        DPrintf(0, "ERROR: Can't update offload settings dynamically!");
+    }
 #else
 UNREFERENCED_PARAMETER(pContext);
 #endif /* PARANDIS_SUPPORT_RSC */
+}
+
+static NDIS_STATUS SetInitialDeviceRSS(PARANDIS_ADAPTER *pContext)
+{
+    NDIS_STATUS status;
+    struct virtio_net_rss_config cfg = {};
+    max_tx_vq(&cfg) = (USHORT)pContext->nPathBundles;
+    DPrintf(0, "[%s]\n", __FUNCTION__);
+    if (!pContext->CXPath.SendControlMessage(VIRTIO_NET_CTRL_MQ,
+        VIRTIO_NET_CTRL_MQ_RSS_CONFIG, &cfg, sizeof(cfg), NULL, 0, 2))
+    {
+        status = NDIS_STATUS_DEVICE_FAILED;
+    }
+    else
+    {
+        status = NDIS_STATUS_SUCCESS;
+    }
+    return status;
 }
 
 NDIS_STATUS ParaNdis_DeviceConfigureMultiQueue(PARANDIS_ADAPTER *pContext)
@@ -1120,8 +1182,14 @@ NDIS_STATUS ParaNdis_DeviceConfigureMultiQueue(PARANDIS_ADAPTER *pContext)
 
     if (pContext->nPathBundles > 1)
     {
+        bool bHasMQ = pContext->u64GuestFeatures & (1LL << VIRTIO_NET_F_MQ);
         u16 nPaths = u16(pContext->nPathBundles);
-        if (!pContext->CXPath.SendControlMessage(VIRTIO_NET_CTRL_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET, &nPaths, sizeof(nPaths), NULL, 0, 2))
+        if (pContext->bRSSSupportedByDevice)
+        {
+            status = SetInitialDeviceRSS(pContext);
+        }
+        else if (bHasMQ &&
+                 !pContext->CXPath.SendControlMessage(VIRTIO_NET_CTRL_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET, &nPaths, sizeof(nPaths), NULL, 0, 2))
         {
             DPrintf(0, "[%s] - Sending MQ control message failed\n", __FUNCTION__);
             status = NDIS_STATUS_DEVICE_FAILED;
@@ -1922,20 +1990,6 @@ ParaNdis_UpdateMAC(PARANDIS_ADAPTER *pContext)
                            NULL, 0, 4);
     }
 }
-
-#if PARANDIS_SUPPORT_RSC
-VOID
-ParaNdis_UpdateGuestOffloads(PARANDIS_ADAPTER *pContext, UINT64 Offloads)
-{
-    if (pContext->RSC.bHasDynamicConfig)
-    {
-        pContext->CXPath.SendControlMessage(VIRTIO_NET_CTRL_GUEST_OFFLOADS, VIRTIO_NET_CTRL_GUEST_OFFLOADS_SET,
-                           &Offloads,
-                           sizeof(Offloads),
-                           NULL, 0, 2);
-    }
-}
-#endif
 
 NDIS_STATUS ParaNdis_PowerOn(PARANDIS_ADAPTER *pContext)
 {
