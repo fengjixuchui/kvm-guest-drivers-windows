@@ -1,5 +1,5 @@
 /*
- * Pre-compiled header file for viosock protocol provider.
+ * Header file for viosock protocol provider installation routines.
  *
  * Copyright (c) 2019 Virtuozzo International GmbH
  *
@@ -27,21 +27,13 @@
  * SUCH DAMAGE.
  */
 
-#ifndef PRECOMP_H
-#define PRECOMP_H
+#ifndef INSTALL_H
+#define INSTALL_H
 
-#include <tchar.h>
-#include <windows.h>
-#include <winsock2.h>
-#include <mswsock.h>
-#include <strsafe.h>
-#include <ws2spi.h>
-#include <winternl.h>
-#include <crtdbg.h>
-#include <winioctl.h>
+BOOL
+InstallProtocol();
 
-#include "..\sys\public.h"
-#include "..\inc\vio_sockets.h"
+BOOL
+DeinstallProtocol();
 
-#include "trace.h"
-#endif //PRECOMP_H
+#endif //INSTALL_H

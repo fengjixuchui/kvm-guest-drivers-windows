@@ -41,21 +41,28 @@ VIOSockInterruptIsr(
 {
     PDEVICE_CONTEXT pContext = GetDeviceContext(WdfInterruptGetDevice(Interrupt));
     WDF_INTERRUPT_INFO info;
+    BOOLEAN serviced;
 
     TraceEvents(TRACE_LEVEL_VERBOSE, DBG_INTERRUPT, "--> %s\n", __FUNCTION__);
 
     WDF_INTERRUPT_INFO_INIT(&info);
     WdfInterruptGetInfo(Interrupt, &info);
 
-    if (VirtIOWdfGetISRStatus(&pContext->VDevice) > 0)
+    // Schedule a DPC if the device is using message-signaled interrupts, or
+    // if the device ISR status is enabled.
+    if (info.MessageSignaled || VirtIOWdfGetISRStatus(&pContext->VDevice))
     {
         WdfInterruptQueueDpcForIsr(Interrupt);
-        return TRUE;
+        serviced = TRUE;
+    }
+    else
+    {
+        serviced = FALSE;
     }
 
     TraceEvents(TRACE_LEVEL_VERBOSE, DBG_INTERRUPT,"<-- %s, interrupt not serviced\n", __FUNCTION__);
 
-    return FALSE;
+    return serviced;
 }
 
 VOID
@@ -64,13 +71,18 @@ VIOSockInterruptDpc(
     IN WDFOBJECT AssociatedObject)
 {
     WDFDEVICE Device = WdfInterruptGetDevice(Interrupt);
-    PDEVICE_CONTEXT Context = GetDeviceContext(Device);
-    WDF_INTERRUPT_INFO info;
+    PDEVICE_CONTEXT pContext = GetDeviceContext(Device);
 
     TraceEvents(TRACE_LEVEL_VERBOSE, DBG_DPC, "--> %s\n", __FUNCTION__);
 
-    WDF_INTERRUPT_INFO_INIT(&info);
-    WdfInterruptGetInfo(Context->WdfInterrupt, &info);
+    // handle the Event queue
+    VIOSockEvtVqProcess(pContext);
+
+    // handle the Read queue
+    VIOSockRxVqProcess(pContext);
+
+    // handle the Write queue
+    VIOSockTxVqProcess(pContext);
 
     TraceEvents(TRACE_LEVEL_VERBOSE, DBG_DPC, "<-- %s\n", __FUNCTION__);
 }
@@ -80,11 +92,17 @@ VIOSockInterruptEnable(
     IN WDFINTERRUPT Interrupt,
     IN WDFDEVICE AssociatedDevice)
 {
-    PDEVICE_CONTEXT Context = GetDeviceContext(WdfInterruptGetDevice(Interrupt));
+    PDEVICE_CONTEXT pContext = GetDeviceContext(WdfInterruptGetDevice(Interrupt));
 
     UNREFERENCED_PARAMETER(AssociatedDevice);
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_INTERRUPT, "--> %s\n", __FUNCTION__);
+
+    virtqueue_enable_cb(pContext->EvtVq);
+    virtqueue_kick(pContext->EvtVq);
+
+    virtqueue_enable_cb(pContext->RxVq);
+    virtqueue_kick(pContext->RxVq);
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_INTERRUPT, "<-- %s\n", __FUNCTION__);
     return STATUS_SUCCESS;
@@ -95,10 +113,19 @@ VIOSockInterruptDisable(
     IN WDFINTERRUPT Interrupt,
     IN WDFDEVICE AssociatedDevice)
 {
-    PDEVICE_CONTEXT Context = GetDeviceContext(WdfInterruptGetDevice(Interrupt));
+    PDEVICE_CONTEXT pContext = GetDeviceContext(WdfInterruptGetDevice(Interrupt));
     UNREFERENCED_PARAMETER(AssociatedDevice);
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_INTERRUPT, "--> %s\n", __FUNCTION__);
+
+    if (pContext->TxVq)
+        virtqueue_disable_cb(pContext->TxVq);
+
+    if (pContext->RxVq)
+        virtqueue_disable_cb(pContext->RxVq);
+
+    if (pContext->EvtVq)
+        virtqueue_disable_cb(pContext->EvtVq);
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_INTERRUPT, "<-- %s\n", __FUNCTION__);
     return STATUS_SUCCESS;

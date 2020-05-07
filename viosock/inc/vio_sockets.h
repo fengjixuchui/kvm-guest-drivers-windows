@@ -46,24 +46,48 @@
 #define PF_VSOCK    AF_VSOCK
 #endif
 
+/* Option name for STREAM socket buffer size.  Use as the option name in
+ * setsockopt or getsockopt to set or get an unsigned long long that
+ * specifies the size of the buffer underlying a vSockets STREAM socket.
+ * Value is clamped to the MIN and MAX.
+ */
+
+#define SO_VM_SOCKETS_BUFFER_SIZE       0x6000
+
+/* Option name for STREAM socket minimum buffer size.  Use as the option name
+ * in setsockopt or getsockopt to set or get an unsigned long long that
+ * specifies the minimum size allowed for the buffer underlying a vSockets
+ * STREAM socket.
+ */
+
+#define SO_VM_SOCKETS_BUFFER_MIN_SIZE   0x6001
+
+ /* Option name for STREAM socket maximum buffer size.  Use as the option name
+  * in setsockopt or getsockopt to set or get an unsigned long long
+  * that specifies the maximum size allowed for the buffer underlying a
+  * vSockets STREAM socket.
+  */
+
+#define SO_VM_SOCKETS_BUFFER_MAX_SIZE   0x6002
+
 /* Any address  for  binding, equivalent of INADDR_ANY.  This works for the svm_cid field of
  * sockaddr_vm and indicates the context ID of the current endpoint.
  */
-#define VMADDR_CID_ANY ((ULONG64)-1)
+#define VMADDR_CID_ANY          (-1)
 
 /* Bind to any available port.  Works for the svm_port field of sockaddr_vm. */
-#define VMADDR_PORT_ANY ((USHORT)-1)
+#define VMADDR_PORT_ANY         (-1)
 
 /* Use this as the destination CID in an address when referring to the hypervisor.*/
-#define VMADDR_CID_HYPERVISOR 0
+#define VMADDR_CID_HYPERVISOR   0
 
 /* Reserved, must not be used. */
-#define VMADDR_CID_RESERVED 1
+#define VMADDR_CID_RESERVED     1
 
 /* Use this as the destination CID in an address when referring to the host
  * (any process other than the hypervisor).
  */
-#define VMADDR_CID_HOST 2
+#define VMADDR_CID_HOST         2
 
 /* Address structure for virtio vsockets. The address family should be set to
  * AF_VSOCK.  The structure members should all align on their natural

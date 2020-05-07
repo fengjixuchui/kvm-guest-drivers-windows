@@ -1,5 +1,5 @@
 /*
- * Placeholder for the provider init functions
+ * Placeholder for the provider functions
  *
  * Copyright (c) 2019 Virtuozzo International GmbH
  *
@@ -115,28 +115,6 @@ WSPStartup(
     return ERROR_SUCCESS;
 }
 
-INT
-NtStatusToWsaError(
-    NTSTATUS Status
-)
-{
-    INT wsaError = (NT_SUCCESS(Status)) ? ERROR_SUCCESS : WSASYSNOTREADY;
-    switch (Status)
-    {
-    case STATUS_INVALID_PARAMETER:
-        wsaError = WSAEINVAL;
-        break;
-    case STATUS_TIMEOUT:
-        wsaError = WSAETIMEDOUT;
-        break;
-        //     case STATUS_ACCESS_DENIED:
-        //         wsaError = WSAEACCES;
-        //         break;
-    }
-
-    return wsaError;
-}
-
 _Must_inspect_result_
 SOCKET
 WSPAPI
@@ -149,17 +127,43 @@ VIOSockAccept(
     _Out_ LPINT lpErrno
 )
 {
-    UNREFERENCED_PARAMETER(addr);
-    UNREFERENCED_PARAMETER(addrlen);
+    HANDLE hFile;
+    VIRTIO_VSOCK_PARAMS SocketParams = { 0 };
+
     UNREFERENCED_PARAMETER(lpfnCondition);
     UNREFERENCED_PARAMETER(dwCallbackData);
 
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
+    TraceEvents(TRACE_LEVEL_VERBOSE, DBG_SOCKET, "--> %s\n", __FUNCTION__);
 
-    *lpErrno = WSAVERNOTSUPPORTED;
+    if (s == 0 || s == INVALID_SOCKET)
+    {
+        TraceEvents(TRACE_LEVEL_WARNING, DBG_SOCKET, "Invalid listen socket\n");
+        *lpErrno = WSAEINVAL;
+        return INVALID_SOCKET;
+    }
 
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
-    return INVALID_SOCKET;
+    SocketParams.Socket = s;
+
+    hFile = VIOSockCreateFile(&SocketParams, lpErrno);
+    if (INVALID_HANDLE_VALUE == hFile)
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_SOCKET, "VIOSockOpenFile failed: %u\n", *lpErrno);
+        return INVALID_SOCKET;
+    }
+
+    s = g_UpcallTable.lpWPUModifyIFSHandle(g_ProtocolInfo.dwCatalogEntryId, (SOCKET)hFile, lpErrno);
+    if (INVALID_SOCKET == s)
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_SOCKET, "g_UpcallTable.lpWPUModifyIFSHandle failed: %u\n", *lpErrno);
+        CloseHandle(hFile);
+    }
+    else
+    {
+        VIOSockGetPeerName(s, addr, addrlen, lpErrno);
+    }
+
+    TraceEvents(TRACE_LEVEL_VERBOSE, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
+    return s;
 }
 
 INT
@@ -173,20 +177,16 @@ VIOSockAddressToString(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
-
     UNREFERENCED_PARAMETER(lpsaAddress);
     UNREFERENCED_PARAMETER(dwAddressLength);
     UNREFERENCED_PARAMETER(lpProtocolInfo);
     UNREFERENCED_PARAMETER(lpszAddressString);
     UNREFERENCED_PARAMETER(lpdwAddressStringLength);
+    UNREFERENCED_PARAMETER(lpErrno);
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s\n", __FUNCTION__);
 
-    *lpErrno = WSAVERNOTSUPPORTED;
-
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
-    return iRes;
+    return ERROR_SUCCESS;
 }
 
 int
@@ -204,12 +204,10 @@ VIOSockAsyncSelect(
     UNREFERENCED_PARAMETER(hWnd);
     UNREFERENCED_PARAMETER(wMsg);
     UNREFERENCED_PARAMETER(lEvent);
+    UNREFERENCED_PARAMETER(lpErrno);
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    *lpErrno = WSAVERNOTSUPPORTED;
-
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
     return iRes;
 }
 
@@ -222,16 +220,23 @@ VIOSockBind(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
+    int iRes = ERROR_SUCCESS;
 
-    UNREFERENCED_PARAMETER(name);
-    UNREFERENCED_PARAMETER(namelen);
+    TraceEvents(TRACE_LEVEL_VERBOSE, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
+    if (namelen < sizeof(SOCKADDR_VM))
+    {
+        TraceEvents(TRACE_LEVEL_WARNING, DBG_SOCKET, "Invalid namelen\n");
+        *lpErrno = WSAEFAULT;
+        return SOCKET_ERROR;
+    }
 
-    *lpErrno = WSAVERNOTSUPPORTED;
+    if (!VIOSockDeviceControl(s, IOCTL_SOCKET_BIND, (PVOID)name, (DWORD)namelen, NULL, 0, NULL, lpErrno))
+    {
+        iRes = SOCKET_ERROR;
+    }
 
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
+    TraceEvents(TRACE_LEVEL_VERBOSE, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
     return iRes;
 }
 
@@ -241,14 +246,11 @@ VIOSockCancelBlockingCall(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
+    UNREFERENCED_PARAMETER(lpErrno);
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s\n", __FUNCTION__);
 
-    *lpErrno = WSAVERNOTSUPPORTED;
-
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
-    return iRes;
+    return ERROR_SUCCESS;
 }
 
 int
@@ -280,7 +282,7 @@ VIOSockCloseSocket(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = 0;
+    int iRes = ERROR_SUCCESS;
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
@@ -289,7 +291,7 @@ VIOSockCloseSocket(
         TraceEvents(TRACE_LEVEL_ERROR, DBG_SOCKET, "CloseHandle failed, socket: %p\n", (PVOID)s);
 
         *lpErrno = WSAEINVAL;
-        iRes = -1;
+        iRes = SOCKET_ERROR;
     }
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
@@ -309,20 +311,30 @@ VIOSockConnect(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
+    int iRes = ERROR_SUCCESS;
 
-    UNREFERENCED_PARAMETER(name);
-    UNREFERENCED_PARAMETER(namelen);
     UNREFERENCED_PARAMETER(lpCallerData);
     UNREFERENCED_PARAMETER(lpCalleeData);
     UNREFERENCED_PARAMETER(lpSQOS);
     UNREFERENCED_PARAMETER(lpGQOS);
 
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    *lpErrno = WSAVERNOTSUPPORTED;
+    TraceEvents(TRACE_LEVEL_VERBOSE, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
+    if (namelen < sizeof(SOCKADDR_VM))
+    {
+        TraceEvents(TRACE_LEVEL_WARNING, DBG_SOCKET, "Invalid namelen\n");
+        *lpErrno = WSAEFAULT;
+        return SOCKET_ERROR;
+    }
+
+    if (!VIOSockDeviceControl(s, IOCTL_SOCKET_CONNECT, (PVOID)name, (DWORD)namelen, NULL, 0, NULL, lpErrno))
+    {
+        TraceEvents(TRACE_LEVEL_WARNING, DBG_SOCKET, "VIOSockDeviceControl failed: %d\n", *lpErrno);
+        iRes = SOCKET_ERROR;
+    }
+
+    TraceEvents(TRACE_LEVEL_VERBOSE, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
     return iRes;
 }
 
@@ -335,17 +347,13 @@ VIOSockDuplicateSocket(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
-
     UNREFERENCED_PARAMETER(dwProcessId);
     UNREFERENCED_PARAMETER(lpProtocolInfo);
+    UNREFERENCED_PARAMETER(lpErrno);
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    *lpErrno = WSAVERNOTSUPPORTED;
-
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
-    return iRes;
+    return ERROR_SUCCESS;
 }
 
 int
@@ -357,14 +365,41 @@ VIOSockEnumNetworkEvents(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
-
-    UNREFERENCED_PARAMETER(hEventObject);
-    UNREFERENCED_PARAMETER(lpNetworkEvents);
+    int iRes = ERROR_SUCCESS;
+    DWORD dwBytesReturned;
+    ULONGLONG ulEvent = (ULONG_PTR)hEventObject;
+    VIRTIO_VSOCK_NETWORK_EVENTS NetEvents = { 0 };
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    *lpErrno = WSAVERNOTSUPPORTED;
+    
+    if (!VIOSockDeviceControl(s, IOCTL_SOCKET_ENUM_NET_EVENTS,
+        (PVOID)&ulEvent, (DWORD)sizeof(ulEvent),
+        &NetEvents, sizeof(NetEvents), &dwBytesReturned, lpErrno))
+    {
+        TraceEvents(TRACE_LEVEL_WARNING, DBG_SOCKET, "VIOSockDeviceControl failed: %d\n", *lpErrno);
+        iRes = SOCKET_ERROR;
+    }
+    else if (dwBytesReturned != sizeof(NetEvents))
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_SOCKET, "Invalid output len: %d\n", dwBytesReturned);
+        *lpErrno = WSAEINVAL;
+        iRes = SOCKET_ERROR;
+    }
+    else
+    {
+        DWORD i;
+        lpNetworkEvents->lNetworkEvents = NetEvents.NetworkEvents;
+        for (i = 0; i < FD_MAX_EVENTS; ++i)
+        {
+            if (NetEvents.NetworkEvents & 1)
+                lpNetworkEvents->iErrorCode[i] = NtStatusToWsaError(NetEvents.Status[i]);
+            else
+                lpNetworkEvents->iErrorCode[i] = ERROR_SUCCESS;
+
+            NetEvents.NetworkEvents >>= 1;
+        }
+    }
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
     return iRes;
@@ -379,14 +414,21 @@ VIOSockEventSelect(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
-
-    UNREFERENCED_PARAMETER(hEventObject);
-    UNREFERENCED_PARAMETER(lNetworkEvents);
+    int iRes = ERROR_SUCCESS;
+    VIRTIO_VSOCK_EVENT_SELECT EventSelect;
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    *lpErrno = WSAVERNOTSUPPORTED;
+    EventSelect.hEventObject = (ULONG_PTR)hEventObject;
+    EventSelect.lNetworkEvents = lNetworkEvents;
+
+    if (!VIOSockDeviceControl(s, IOCTL_SOCKET_EVENT_SELECT,
+        &EventSelect, (DWORD)sizeof(EventSelect),
+        NULL, 0, NULL, lpErrno))
+    {
+        TraceEvents(TRACE_LEVEL_WARNING, DBG_SOCKET, "VIOSockDeviceControl failed: %d\n", *lpErrno);
+        iRes = SOCKET_ERROR;
+    }
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
     return iRes;
@@ -403,19 +445,15 @@ VIOSockGetOverlappedResult(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
-
     UNREFERENCED_PARAMETER(lpOverlapped);
     UNREFERENCED_PARAMETER(lpcbTransfer);
     UNREFERENCED_PARAMETER(fWait);
     UNREFERENCED_PARAMETER(lpdwFlags);
+    UNREFERENCED_PARAMETER(lpErrno);
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    *lpErrno = WSAVERNOTSUPPORTED;
-
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
-    return iRes;
+    return ERROR_SUCCESS;
 }
 
 int
@@ -427,16 +465,25 @@ VIOSockGetPeerName(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
+    int iRes = ERROR_SUCCESS;
 
-    UNREFERENCED_PARAMETER(name);
-    UNREFERENCED_PARAMETER(namelen);
+    TraceEvents(TRACE_LEVEL_VERBOSE, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
+    if (*namelen < sizeof(SOCKADDR_VM))
+    {
+        TraceEvents(TRACE_LEVEL_WARNING, DBG_SOCKET, "Invalid namelen\n");
+        *lpErrno = WSAEINVAL;
+        return SOCKET_ERROR;
+    }
 
-    *lpErrno = WSAVERNOTSUPPORTED;
+    if (!VIOSockDeviceControl(s, IOCTL_SOCKET_GET_PEER_NAME,
+        NULL, 0, (PVOID)name, *namelen, (LPDWORD)namelen, lpErrno))
+    {
+        TraceEvents(TRACE_LEVEL_WARNING, DBG_SOCKET, "VIOSockDeviceControl failed: %d\n", *lpErrno);
+        iRes = SOCKET_ERROR;
+    }
 
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
+    TraceEvents(TRACE_LEVEL_VERBOSE, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
     return iRes;
 }
 
@@ -449,16 +496,25 @@ VIOSockGetSockName(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
+    int iRes = ERROR_SUCCESS;
 
-    UNREFERENCED_PARAMETER(name);
-    UNREFERENCED_PARAMETER(namelen);
+    TraceEvents(TRACE_LEVEL_VERBOSE, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
+    if (*namelen < sizeof(SOCKADDR_VM))
+    {
+        TraceEvents(TRACE_LEVEL_WARNING, DBG_SOCKET, "Invalid namelen\n");
+        *lpErrno = WSAEINVAL;
+        return SOCKET_ERROR;
+    }
 
-    *lpErrno = WSAVERNOTSUPPORTED;
+    if (!VIOSockDeviceControl(s, IOCTL_SOCKET_GET_SOCK_NAME,
+        NULL, 0, (PVOID)name, *namelen, (LPDWORD)namelen, lpErrno))
+    {
+        TraceEvents(TRACE_LEVEL_WARNING, DBG_SOCKET, "VIOSockDeviceControl failed: %d\n", *lpErrno);
+        iRes = SOCKET_ERROR;
+    }
 
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
+    TraceEvents(TRACE_LEVEL_VERBOSE, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
     return iRes;
 }
 
@@ -473,18 +529,41 @@ VIOSockGetSockOpt(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
+    int iRes = ERROR_SUCCESS;
+    VIRTIO_VSOCK_OPT Opt = { 0 };
+    DWORD dwBytesReturned;
 
-    UNREFERENCED_PARAMETER(level);
-    UNREFERENCED_PARAMETER(optname);
-    UNREFERENCED_PARAMETER(optval);
-    UNREFERENCED_PARAMETER(optlen);
+    TraceEvents(TRACE_LEVEL_VERBOSE, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
+    if (!optlen)
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_SOCKET, "Invalid optlen\n");
+        *lpErrno = WSAEINVAL;
+        return SOCKET_ERROR;
+    }
 
-    *lpErrno = WSAVERNOTSUPPORTED;
+    Opt.level = level;
+    Opt.optname = optname;
+    Opt.optval = (ULONGLONG)optval;
+    Opt.optlen = *optlen;
 
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
+    if (!VIOSockDeviceControl(s, IOCTL_SOCKET_GET_SOCK_OPT,
+        &Opt, sizeof(Opt), &Opt, sizeof(Opt), &dwBytesReturned, lpErrno))
+    {
+        TraceEvents(TRACE_LEVEL_WARNING, DBG_SOCKET, "VIOSockDeviceControl failed: %d\n", *lpErrno);
+        iRes = SOCKET_ERROR;
+    }
+    else if (dwBytesReturned == sizeof(Opt))
+    {
+        *optlen = Opt.optlen;
+    }
+    else
+    {
+        *lpErrno = WSAEINVAL;
+        return SOCKET_ERROR;
+    }
+
+    TraceEvents(TRACE_LEVEL_VERBOSE, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
     return iRes;
 }
 
@@ -497,17 +576,14 @@ VIOSockGetQOSByName(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
-
+    UNREFERENCED_PARAMETER(s);
     UNREFERENCED_PARAMETER(lpQOSName);
     UNREFERENCED_PARAMETER(lpQOS);
+    UNREFERENCED_PARAMETER(lpErrno);
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    *lpErrno = WSAVERNOTSUPPORTED;
-
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
-    return iRes;
+    return ERROR_SUCCESS;
 }
 
 int
@@ -526,23 +602,51 @@ VIOSockIoctl(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
+    int iRes = ERROR_SUCCESS;
+    VIRTIO_VSOCK_IOCTL_IN InParams;
 
-    UNREFERENCED_PARAMETER(dwIoControlCode);
-    UNREFERENCED_PARAMETER(lpvInBuffer);
-    UNREFERENCED_PARAMETER(cbInBuffer);
-    UNREFERENCED_PARAMETER(lpvOutBuffer);
-    UNREFERENCED_PARAMETER(cbOutBuffer);
-    UNREFERENCED_PARAMETER(lpcbBytesReturned);
-    UNREFERENCED_PARAMETER(lpOverlapped);
-    UNREFERENCED_PARAMETER(lpCompletionRoutine);
     UNREFERENCED_PARAMETER(lpThreadId);
 
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
+    TraceEvents(TRACE_LEVEL_VERBOSE, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    *lpErrno = WSAVERNOTSUPPORTED;
+    if (lpOverlapped || lpCompletionRoutine)
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_SOCKET, "Overlapped sockets not supported\n");
+        *lpErrno = WSAEOPNOTSUPP;
+        return SOCKET_ERROR;
+    }
 
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
+    if (dwIoControlCode == SIO_BSP_HANDLE ||
+//        dwIoControlCode == SIO_BSP_HANDLE_POLL ||
+        dwIoControlCode == SIO_BSP_HANDLE_SELECT)
+    {
+        if (lpvOutBuffer&&cbOutBuffer >= sizeof(s))
+        {
+            *(SOCKET*)lpvOutBuffer = s;
+            if (lpcbBytesReturned)
+                *lpcbBytesReturned = sizeof(s);
+            return ERROR_SUCCESS;
+        }
+        else
+        {
+            *lpErrno = WSAEFAULT;
+            return SOCKET_ERROR;
+        }
+    }
+
+
+    InParams.dwIoControlCode = dwIoControlCode;
+    InParams.lpvInBuffer = (ULONGLONG)lpvInBuffer;
+    InParams.cbInBuffer = cbInBuffer;
+
+    if (!VIOSockDeviceControl(s, IOCTL_SOCKET_IOCTL,
+        &InParams, sizeof(InParams), lpvOutBuffer, cbOutBuffer, lpcbBytesReturned, lpErrno))
+    {
+        TraceEvents(TRACE_LEVEL_WARNING, DBG_SOCKET, "VIOSockDeviceControl failed: %d\n", *lpErrno);
+        iRes = SOCKET_ERROR;
+    }
+
+    TraceEvents(TRACE_LEVEL_VERBOSE, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
     return iRes;
 }
 
@@ -567,13 +671,11 @@ VIOSockJoinLeaf(
     UNREFERENCED_PARAMETER(lpSQOS);
     UNREFERENCED_PARAMETER(lpGQOS);
     UNREFERENCED_PARAMETER(dwFlags);
+    UNREFERENCED_PARAMETER(lpErrno);
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    *lpErrno = WSAVERNOTSUPPORTED;
-
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
-    return INVALID_SOCKET;
+    return ERROR_SUCCESS;
 }
 
 int
@@ -584,13 +686,16 @@ VIOSockListen(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
-
-    UNREFERENCED_PARAMETER(backlog);
+    int iRes = ERROR_SUCCESS;
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    *lpErrno = WSAVERNOTSUPPORTED;
+    if (!VIOSockDeviceControl(s, IOCTL_SOCKET_LISTEN,
+        &backlog, (DWORD)sizeof(backlog), NULL, 0, NULL, lpErrno))
+    {
+        TraceEvents(TRACE_LEVEL_WARNING, DBG_SOCKET, "VIOSockDeviceControl failed: %d\n", *lpErrno);
+        iRes = SOCKET_ERROR;
+    }
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
     return iRes;
@@ -610,19 +715,54 @@ VIOSockRecv(
     _In_ LPINT lpErrno
 )
 {
-    int iRes = -1;
+    int iRes = ERROR_SUCCESS;
+    DWORD i;
 
-    UNREFERENCED_PARAMETER(lpBuffers);
-    UNREFERENCED_PARAMETER(dwBufferCount);
-    UNREFERENCED_PARAMETER(lpNumberOfBytesRecvd);
     UNREFERENCED_PARAMETER(lpFlags);
-    UNREFERENCED_PARAMETER(lpOverlapped);
-    UNREFERENCED_PARAMETER(lpCompletionRoutine);
     UNREFERENCED_PARAMETER(lpThreadId);
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    *lpErrno = WSAVERNOTSUPPORTED;
+    if (lpOverlapped || lpCompletionRoutine)
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_SOCKET, "Overlapped sockets not supported\n");
+        *lpErrno = WSAEOPNOTSUPP;
+        return SOCKET_ERROR;
+    }
+
+    *lpNumberOfBytesRecvd = 0;
+
+    if (!dwBufferCount)
+        return ERROR_SUCCESS;
+
+    for (i = 0; i < dwBufferCount; ++i)
+    {
+        DWORD dwNumberOfBytesRead;
+        if (*lpFlags)
+        {
+            VIRTIO_VSOCK_READ_PARAMS ReadParams;
+            ReadParams.Flags = *lpFlags;
+
+            if (!VIOSockDeviceControl(s, IOCTL_SOCKET_READ,
+                &ReadParams, (DWORD)sizeof(ReadParams),
+                lpBuffers[i].buf, lpBuffers[i].len, &dwNumberOfBytesRead, lpErrno))
+            {
+                TraceEvents(TRACE_LEVEL_WARNING, DBG_SOCKET, "VIOSockDeviceControl failed: %d\n", *lpErrno);
+                iRes = SOCKET_ERROR;
+            }
+        }
+        else if (!VIOSockReadFile(s, lpBuffers[i].buf, lpBuffers[i].len, &dwNumberOfBytesRead, lpErrno))
+        {
+            iRes = SOCKET_ERROR;
+            break;
+        }
+
+        *lpNumberOfBytesRecvd += dwNumberOfBytesRead;
+        if (dwNumberOfBytesRead != lpBuffers[i].len)
+        {
+            break;
+        }
+    }
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
     return iRes;
@@ -636,16 +776,12 @@ VIOSockRecvDisconnect(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
-
     UNREFERENCED_PARAMETER(lpInboundDisconnectData);
+    UNREFERENCED_PARAMETER(lpErrno);
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    *lpErrno = WSAVERNOTSUPPORTED;
-
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
-    return iRes;
+    return ERROR_SUCCESS;
 }
 
 int
@@ -664,24 +800,61 @@ VIOSockRecvFrom(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
-
-    UNREFERENCED_PARAMETER(lpBuffers);
-    UNREFERENCED_PARAMETER(dwBufferCount);
-    UNREFERENCED_PARAMETER(lpNumberOfBytesRecvd);
-    UNREFERENCED_PARAMETER(lpFlags);
-    UNREFERENCED_PARAMETER(lpFrom);
-    UNREFERENCED_PARAMETER(lpFromlen);
-    UNREFERENCED_PARAMETER(lpOverlapped);
-    UNREFERENCED_PARAMETER(lpCompletionRoutine);
-    UNREFERENCED_PARAMETER(lpThreadId);
-
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    *lpErrno = WSAVERNOTSUPPORTED;
+    if (VIOSockGetPeerName(s, lpFrom, lpFromlen, lpErrno) == SOCKET_ERROR)
+    {
+        TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "VIOSockGetPeerName failed: %u\n", *lpErrno);
+        return SOCKET_ERROR;
+    }
 
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
-    return iRes;
+    return VIOSockRecv(s, lpBuffers, dwBufferCount,
+        lpNumberOfBytesRecvd, lpFlags, lpOverlapped,
+        lpCompletionRoutine, lpThreadId, lpErrno);
+}
+
+static
+int
+CopyFromFdSet(
+    _Out_ VIRTIO_VSOCK_FD_SET *Dst,
+    _In_ fd_set *Src
+)
+{
+    UINT i;
+
+    if (!Src)
+        return 0;
+
+    if (Src->fd_count > FD_SETSIZE)
+        return SOCKET_ERROR;
+
+    Dst->fd_count = Src->fd_count;
+    for (i = 0; i < Dst->fd_count; ++i)
+    {
+        Dst->fd_array[i] = (ULONGLONG)(ULONG_PTR)Src->fd_array[i];
+    }
+
+    return Dst->fd_count;
+}
+
+static
+int
+CopyToFdSet(
+    _Out_ fd_set *Dst,
+    _In_ VIRTIO_VSOCK_FD_SET *Src
+)
+{
+    UINT i;
+
+    _ASSERT(Src->fd_count <= FD_SETSIZE && Src->fd_count <= Dst->fd_count);
+
+    Dst->fd_count = Src->fd_count;
+    for (i = 0; i < Dst->fd_count; ++i)
+    {
+        Dst->fd_array[i] = (SOCKET)(ULONG_PTR)Src->fd_array[i];
+    }
+
+    return Dst->fd_count;
 }
 
 int
@@ -695,19 +868,83 @@ VIOSockSelect(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
+    int iRes = 0, iReadCount, iWriteCount, iExceptCount;
+    VIRTIO_VSOCK_SELECT Select = { 0 };
+    HANDLE hFile;
+    DWORD dwBytesReturned;
 
     UNREFERENCED_PARAMETER(nfds);
-    UNREFERENCED_PARAMETER(readfds);
-    UNREFERENCED_PARAMETER(writefds);
-    UNREFERENCED_PARAMETER(exceptfds);
-    UNREFERENCED_PARAMETER(timeout);
 
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s\n", __FUNCTION__);
+    TraceEvents(TRACE_LEVEL_VERBOSE, DBG_SOCKET, "--> %s\n", __FUNCTION__);
 
-    *lpErrno = WSAVERNOTSUPPORTED;
+    iReadCount = CopyFromFdSet(&Select.ReadFds, readfds);
+    if (iReadCount == SOCKET_ERROR)
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_SOCKET, "Invalid readfds parameter\n");
+        *lpErrno = WSAEINVAL;
+        return SOCKET_ERROR;
+    }
 
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
+    iWriteCount = CopyFromFdSet(&Select.WriteFds, writefds);
+    if (iWriteCount == SOCKET_ERROR)
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_SOCKET, "Invalid writefds parameter\n");
+        *lpErrno = WSAEINVAL;
+        return SOCKET_ERROR;
+    }
+
+    iExceptCount = CopyFromFdSet(&Select.ExceptFds, exceptfds);
+    if (iExceptCount == SOCKET_ERROR)
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_SOCKET, "Invalid exceptfds parameter\n");
+        *lpErrno = WSAEINVAL;
+        return SOCKET_ERROR;
+    }
+
+    if ((iReadCount + iWriteCount + iExceptCount) > FD_SETSIZE)
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_SOCKET, "Input set is too large\n");
+        *lpErrno = WSAEINVAL;
+        return SOCKET_ERROR;
+    }
+
+    if (timeout)
+    {
+        //timeout in 100-ns intervals
+        Select.Timeout.QuadPart = -(SEC_TO_NANO((LONGLONG)timeout->tv_sec) + USEC_TO_NANO(timeout->tv_usec));
+    }
+
+    hFile = VIOSockCreateFile(NULL, lpErrno);
+    if (hFile != INVALID_HANDLE_VALUE)
+    {
+        if (!VIOSockDeviceControl((SOCKET)hFile, IOCTL_SELECT,
+            &Select, sizeof(Select), &Select, sizeof(Select), &dwBytesReturned, lpErrno))
+        {
+            TraceEvents(TRACE_LEVEL_WARNING, DBG_SOCKET, "VIOSockDeviceControl failed: %d\n", *lpErrno);
+            iRes = SOCKET_ERROR;
+        }
+        else if (dwBytesReturned == sizeof(Select))
+        {
+            iRes = CopyToFdSet(readfds, &Select.ReadFds) +
+                CopyToFdSet(writefds, &Select.WriteFds) +
+                CopyToFdSet(exceptfds, &Select.ExceptFds);
+        }
+        else
+        {
+            TraceEvents(TRACE_LEVEL_ERROR, DBG_SOCKET, "Invalid output len: %u\n", dwBytesReturned);
+            *lpErrno = WSAEINVAL;
+            iRes = SOCKET_ERROR;
+        }
+
+        CloseHandle(hFile);
+    }
+    else
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_SOCKET, "VIOSockCreateFile failed: %d\n", *lpErrno);
+        iRes = SOCKET_ERROR;
+    }
+
+    TraceEvents(TRACE_LEVEL_VERBOSE, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
     return iRes;
 }
 
@@ -725,19 +962,39 @@ VIOSockSend(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
+    int iRes = ERROR_SUCCESS;
+    DWORD i;
 
-    UNREFERENCED_PARAMETER(lpBuffers);
-    UNREFERENCED_PARAMETER(dwBufferCount);
-    UNREFERENCED_PARAMETER(lpNumberOfBytesSent);
     UNREFERENCED_PARAMETER(dwFlags);
-    UNREFERENCED_PARAMETER(lpOverlapped);
-    UNREFERENCED_PARAMETER(lpCompletionRoutine);
     UNREFERENCED_PARAMETER(lpThreadId);
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    *lpErrno = WSAVERNOTSUPPORTED;
+    if (lpOverlapped || lpCompletionRoutine)
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_SOCKET, "Overlapped sockets not supported\n");
+        *lpErrno = WSAEOPNOTSUPP;
+        return SOCKET_ERROR;
+    }
+
+    *lpNumberOfBytesSent = 0;
+
+    for (i = 0; i < dwBufferCount; ++i)
+    {
+        DWORD dwNumberOfBytesWritten;
+
+        if (!VIOSockWriteFile(s, lpBuffers[i].buf, lpBuffers[i].len, &dwNumberOfBytesWritten, lpErrno))
+        {
+            iRes = SOCKET_ERROR;
+            break;
+        }
+
+        *lpNumberOfBytesSent += dwNumberOfBytesWritten;
+        if (dwNumberOfBytesWritten != lpBuffers[i].len)
+        {
+            break;
+        }
+    }
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
     return iRes;
@@ -751,16 +1008,12 @@ VIOSockSendDisconnect(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
-
     UNREFERENCED_PARAMETER(lpOutboundDisconnectData);
+    UNREFERENCED_PARAMETER(lpErrno);
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    *lpErrno = WSAVERNOTSUPPORTED;
-
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
-    return iRes;
+    return ERROR_SUCCESS;
 }
 
 int
@@ -779,24 +1032,14 @@ VIOSockSendTo(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
-
-    UNREFERENCED_PARAMETER(lpBuffers);
-    UNREFERENCED_PARAMETER(dwBufferCount);
-    UNREFERENCED_PARAMETER(lpNumberOfBytesSent);
-    UNREFERENCED_PARAMETER(dwFlags);
     UNREFERENCED_PARAMETER(lpTo);
     UNREFERENCED_PARAMETER(iTolen);
-    UNREFERENCED_PARAMETER(lpOverlapped);
-    UNREFERENCED_PARAMETER(lpCompletionRoutine);
-    UNREFERENCED_PARAMETER(lpThreadId);
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    *lpErrno = WSAVERNOTSUPPORTED;
-
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
-    return iRes;
+    return VIOSockSend(s, lpBuffers, dwBufferCount,
+        lpNumberOfBytesSent, dwFlags, lpOverlapped,
+        lpCompletionRoutine, lpThreadId, lpErrno);
 }
 
 int
@@ -810,18 +1053,31 @@ VIOSockSetSockOpt(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
+    int iRes = ERROR_SUCCESS;
+    VIRTIO_VSOCK_OPT Opt = { 0 };
 
-    UNREFERENCED_PARAMETER(level);
-    UNREFERENCED_PARAMETER(optname);
-    UNREFERENCED_PARAMETER(optval);
-    UNREFERENCED_PARAMETER(optlen);
+    TraceEvents(TRACE_LEVEL_VERBOSE, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
+    if (!optlen)
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_SOCKET, "Invalid optlen\n");
+        *lpErrno = WSAEINVAL;
+        return SOCKET_ERROR;
+    }
 
-    *lpErrno = WSAVERNOTSUPPORTED;
+    Opt.level = level;
+    Opt.optname = optname;
+    Opt.optval = (ULONGLONG)optval;
+    Opt.optlen = optlen;
 
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
+    if (!VIOSockDeviceControl(s, IOCTL_SOCKET_SET_SOCK_OPT,
+        &Opt, sizeof(Opt), NULL, 0, NULL, lpErrno))
+    {
+        TraceEvents(TRACE_LEVEL_WARNING, DBG_SOCKET, "VIOSockDeviceControl failed: %d\n", *lpErrno);
+        iRes = SOCKET_ERROR;
+    }
+
+    TraceEvents(TRACE_LEVEL_VERBOSE, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
     return iRes;
 }
 
@@ -833,65 +1089,19 @@ VIOSockShutdown(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
-
-    UNREFERENCED_PARAMETER(how);
+    int iRes = ERROR_SUCCESS;
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s, socket: %p\n", __FUNCTION__, (PVOID)s);
 
-    *lpErrno = WSAVERNOTSUPPORTED;
+    if (!VIOSockDeviceControl(s, IOCTL_SOCKET_SHUTDOWN,
+        &how, (DWORD)sizeof(how), NULL, 0, NULL, lpErrno))
+    {
+        TraceEvents(TRACE_LEVEL_WARNING, DBG_SOCKET, "VIOSockDeviceControl failed: %d\n", *lpErrno);
+        iRes = SOCKET_ERROR;
+    }
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
     return iRes;
-}
-
-typedef struct _FILE_FULL_EA_INFORMATION {
-    ULONG NextEntryOffset;
-    UCHAR Flags;
-    UCHAR EaNameLength;
-    USHORT EaValueLength;
-    CHAR EaName[1];
-} FILE_FULL_EA_INFORMATION, *PFILE_FULL_EA_INFORMATION;
-
-HANDLE
-VIOSockOpenFile(
-    _In_opt_ PVIRTIO_VSOCK_PARAMS pSocketParams,
-    _Out_ LPINT lpErrno
-)
-{
-    HANDLE hFile = INVALID_HANDLE_VALUE;
-    NTSTATUS Status;
-    OBJECT_ATTRIBUTES oa;
-    IO_STATUS_BLOCK iosb = { 0 };
-    UNICODE_STRING usDeviceName = RTL_CONSTANT_STRING(VIOSOCK_NAME);
-
-    UCHAR EaBuffer[sizeof(FILE_FULL_EA_INFORMATION) + sizeof(*pSocketParams)] = { 0 };
-    PFILE_FULL_EA_INFORMATION pEaBuffer = (PFILE_FULL_EA_INFORMATION)EaBuffer;
-
-    if (pSocketParams)
-    {
-        pEaBuffer->EaNameLength = sizeof(FILE_FULL_EA_INFORMATION) -
-            FIELD_OFFSET(FILE_FULL_EA_INFORMATION, EaName) - sizeof(UCHAR);
-        pEaBuffer->EaValueLength = sizeof(*pSocketParams);
-        memcpy(&EaBuffer[sizeof(FILE_FULL_EA_INFORMATION)], pSocketParams, sizeof(*pSocketParams));
-    }
-    else
-        pEaBuffer = NULL;
-
-    InitializeObjectAttributes(&oa, &usDeviceName, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-    Status = NtCreateFile(&hFile, FILE_GENERIC_READ | FILE_GENERIC_WRITE, &oa, &iosb, 0, 0,
-        FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN, FILE_NON_DIRECTORY_FILE, pEaBuffer,
-        pEaBuffer ? sizeof(EaBuffer) : 0);
-
-    if (!NT_SUCCESS(Status))
-    {
-        _ASSERT(hFile == INVALID_HANDLE_VALUE);
-        TraceEvents(TRACE_LEVEL_ERROR, DBG_SOCKET, "NtCreateFile failed: %x\n", Status);
-        *lpErrno = NtStatusToWsaError(Status);
-    }
-
-    return hFile;
 }
 
 _Must_inspect_result_
@@ -917,17 +1127,28 @@ VIOSockSocket(
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s\n", __FUNCTION__);
 
-    if (af != AF_VSOCK || type != SOCK_STREAM || protocol != 0)
+    if (af != AF_VSOCK || protocol != 0)
     {
         TraceEvents(TRACE_LEVEL_ERROR, DBG_SOCKET, "Invalid parameters\n");
         *lpErrno = WSAEINVAL;
         return INVALID_SOCKET;
     }
 
-    hFile = VIOSockOpenFile(&SocketParams, lpErrno);
+    if (type == SOCK_STREAM)
+    {
+        SocketParams.Type = VIRTIO_VSOCK_TYPE_STREAM;
+    }
+    else
+    {
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_SOCKET, "Unsupported socket type\n");
+        *lpErrno = WSAEINVAL;
+        return INVALID_SOCKET;
+    }
+
+    hFile = VIOSockCreateFile(&SocketParams, lpErrno);
     if (INVALID_HANDLE_VALUE == hFile)
     {
-        TraceEvents(TRACE_LEVEL_ERROR, DBG_SOCKET, "VIOSockCreateSocket failed: %u\n", *lpErrno);
+        TraceEvents(TRACE_LEVEL_ERROR, DBG_SOCKET, "VIOSockCreateFile failed: %u\n", *lpErrno);
         return INVALID_SOCKET;
     }
 
@@ -953,18 +1174,14 @@ VIOSockStringToAddress(
     _Out_ LPINT lpErrno
 )
 {
-    int iRes = -1;
-
     UNREFERENCED_PARAMETER(AddressString);
     UNREFERENCED_PARAMETER(AddressFamily);
     UNREFERENCED_PARAMETER(lpProtocolInfo);
     UNREFERENCED_PARAMETER(lpAddress);
     UNREFERENCED_PARAMETER(lpAddressLength);
+    UNREFERENCED_PARAMETER(lpErrno);
 
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "--> %s\n", __FUNCTION__);
 
-    *lpErrno = WSAVERNOTSUPPORTED;
-
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_SOCKET, "<-- %s\n", __FUNCTION__);
-    return iRes;
+    return ERROR_SUCCESS;
 }
