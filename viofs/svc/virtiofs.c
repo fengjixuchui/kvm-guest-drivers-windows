@@ -52,14 +52,26 @@
 #define FS_SERVICE_NAME TEXT("VirtIO-FS")
 #define ALLOCATION_UNIT 4096
 
-#if !defined(O_DIRECTORY)
-#define O_DIRECTORY 0x200000
-#endif
+#define INVALID_FILE_HANDLE ((uint64_t)(-1))
+
+// Some of the constants defined in Windows doesn't match the values that are
+// used in Linux. Don't try just to understand, just redefine them to match.
+#undef O_DIRECTORY
+#undef O_EXCL
+#undef S_IFMT
+#undef S_IFDIR
+
+#define O_DIRECTORY 0200000
+#define O_EXCL      0200
+#define S_IFMT      0170000
+#define S_IFDIR     040000
 
 #define DBG(format, ...) \
     FspDebugLog("*** %s: " format "\n", __FUNCTION__, __VA_ARGS__)
 
 #define SafeHeapFree(p) if (p != NULL) { HeapFree(GetProcessHeap(), 0, p); }
+
+#define ReadAndExecute(x) ((x) | (((x) & 0444) >> 2))
 
 typedef struct
 {
@@ -89,6 +101,13 @@ typedef struct
     uint64_t FileHandle;
 
 } VIRTFS_FILE_CONTEXT, *PVIRTFS_FILE_CONTEXT;
+
+static NTSTATUS SetBasicInfo(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
+    UINT32 FileAttributes, UINT64 CreationTime, UINT64 LastAccessTime,
+    UINT64 LastWriteTime, UINT64 ChangeTime, FSP_FSCTL_FILE_INFO *FileInfo);
+
+static NTSTATUS SetFileSize(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
+    UINT64 NewSize, BOOLEAN SetAllocationSize, FSP_FSCTL_FILE_INFO *FileInfo);
 
 static int64_t GetUniqueIdentifier()
 {
@@ -245,23 +264,73 @@ static UINT32 PosixUnixModeToAttributes(uint32_t mode)
             break;
 
         default:
-            Attributes = FILE_ATTRIBUTE_NORMAL;
+            Attributes = FILE_ATTRIBUTE_ARCHIVE;
             break;
     }
 
+    if (!!(mode & 0222) == FALSE)
+    {
+        Attributes |= FILE_ATTRIBUTE_READONLY;
+    }
+
     return Attributes;
+}
+
+static uint32_t AccessToUnixFlags(UINT32 GrantedAccess)
+{
+    uint32_t flags;
+
+    switch (GrantedAccess & (FILE_READ_DATA | FILE_WRITE_DATA))
+    {
+        case FILE_WRITE_DATA:
+            flags = O_WRONLY;
+            break;
+        case FILE_READ_DATA | FILE_WRITE_DATA:
+            flags = O_RDWR;
+            break;
+        case FILE_READ_DATA:
+            __fallthrough;
+        default:
+            flags = O_RDONLY;
+            break;
+    }
+
+    if ((GrantedAccess & FILE_APPEND_DATA) && (flags == 0))
+    {
+        flags = O_RDWR;
+    }
+
+    return flags;
+}
+
+static VOID FileTimeToUnixTime(UINT64 FileTime, uint64_t *time,
+    uint32_t *nsec)
+{
+    __int3264 UnixTime[2];
+    FspPosixFileTimeToUnixTime(FileTime, UnixTime);
+    *time = UnixTime[0];
+    *nsec = (uint32_t)UnixTime[1];
+}
+
+static VOID UnixTimeToFileTime(uint64_t time, uint32_t nsec,
+    PUINT64 PFileTime)
+{
+    __int3264 UnixTime[2];
+    UnixTime[0] = time;
+    UnixTime[1] = nsec;
+    FspPosixUnixTimeToFileTime(UnixTime, PFileTime);
 }
 
 static VOID SetFileInfo(struct fuse_attr *attr, FSP_FSCTL_FILE_INFO *FileInfo)
 {
     FileInfo->FileAttributes = PosixUnixModeToAttributes(attr->mode);
     FileInfo->ReparseTag = 0;
-    FileInfo->AllocationSize = attr->blocks * attr->blksize;
+    FileInfo->AllocationSize = attr->blocks * 512;
     FileInfo->FileSize = attr->size;
-    FspPosixUnixTimeToFileTime((void *)&attr->ctime, &FileInfo->CreationTime);
-    FspPosixUnixTimeToFileTime((void *)&attr->atime,
+    UnixTimeToFileTime(attr->ctime, attr->ctimensec, &FileInfo->CreationTime);
+    UnixTimeToFileTime(attr->atime, attr->atimensec,
         &FileInfo->LastAccessTime);
-    FspPosixUnixTimeToFileTime((void *)&attr->mtime,
+    UnixTimeToFileTime(attr->mtime, attr->mtimensec,
         &FileInfo->LastWriteTime);
     FileInfo->ChangeTime = FileInfo->LastWriteTime;
     FileInfo->IndexNumber = 0;
@@ -331,6 +400,9 @@ static NTSTATUS VirtFsFuseRequest(HANDLE Device, LPVOID InBuffer,
             case -ENOMEM:
                 Status = STATUS_INSUFFICIENT_RESOURCES;
                 break;
+            case -EEXIST:
+                Status = STATUS_OBJECT_NAME_COLLISION;
+                break;
             case -EINVAL:
                 Status = STATUS_INVALID_PARAMETER;
                 break;
@@ -354,7 +426,8 @@ static NTSTATUS VirtFsFuseRequest(HANDLE Device, LPVOID InBuffer,
 
 static NTSTATUS VirtFsCreateFile(VIRTFS *VirtFs,
     VIRTFS_FILE_CONTEXT *FileContext, UINT32 GrantedAccess, CHAR *FileName,
-    UINT64 Parent, UINT32 Mode, FSP_FSCTL_FILE_INFO *FileInfo)
+    UINT64 Parent, UINT32 Mode, UINT64 AllocationSize,
+    FSP_FSCTL_FILE_INFO *FileInfo)
 {
     NTSTATUS Status;
     FUSE_CREATE_IN create_in;
@@ -369,26 +442,7 @@ static NTSTATUS VirtFsCreateFile(VIRTFS *VirtFs,
     lstrcpyA(create_in.name, FileName);
     create_in.create.mode = Mode;
     create_in.create.umask = 0;
-
-    switch (GrantedAccess & (FILE_READ_DATA | FILE_WRITE_DATA))
-    {
-        case FILE_WRITE_DATA:
-            create_in.create.flags = O_WRONLY;
-            break;
-        case FILE_READ_DATA | FILE_WRITE_DATA:
-            create_in.create.flags = O_RDWR;
-            break;
-        case FILE_READ_DATA:
-            __fallthrough;
-        default:
-            create_in.create.flags = O_RDONLY;
-            break;
-    }
-
-    if (GrantedAccess & FILE_APPEND_DATA)
-    {
-        create_in.create.flags |= O_APPEND;
-    }
+    create_in.create.flags = AccessToUnixFlags(GrantedAccess) | O_EXCL;
 
     DBG("create_in.create.flags: 0x%08x", create_in.create.flags);
     DBG("create_in.create.mode: 0x%08x", create_in.create.mode);
@@ -400,7 +454,16 @@ static NTSTATUS VirtFsCreateFile(VIRTFS *VirtFs,
     {
         FileContext->NodeId = create_out.entry.nodeid;
         FileContext->FileHandle = create_out.open.fh;
-        SetFileInfo(&create_out.entry.attr, FileInfo);
+
+        if (AllocationSize > 0)
+        {
+            Status = SetFileSize(VirtFs->FileSystem, FileContext,
+                AllocationSize, TRUE, FileInfo);
+        }
+        else
+        {
+            SetFileInfo(&create_out.entry.attr, FileInfo);
+        }
     }
 
     return Status;
@@ -421,7 +484,7 @@ static NTSTATUS VirtFsCreateDir(VIRTFS *VirtFs,
     mkdir_in.hdr.gid = VirtFs->OwnerGid;
 
     lstrcpyA(mkdir_in.name, FileName);
-    mkdir_in.mkdir.mode = Mode;
+    mkdir_in.mkdir.mode = Mode | 0111; /* ---x--x--x */
     mkdir_in.mkdir.umask = 0;
 
     Status = VirtFsFuseRequest(VirtFs->Device, &mkdir_in, mkdir_in.hdr.len,
@@ -539,30 +602,29 @@ static NTSTATUS VirtFsLookupFileName(HANDLE Device, PWSTR FileName,
     return Status;
 }
 
-static NTSTATUS GetFileInfoInternal(VIRTFS *VirtFs, uint64_t nodeid,
-    uint64_t fh, FSP_FSCTL_FILE_INFO *FileInfo,
+static NTSTATUS GetFileInfoInternal(VIRTFS *VirtFs,
+    PVIRTFS_FILE_CONTEXT FileContext, FSP_FSCTL_FILE_INFO *FileInfo,
     PSECURITY_DESCRIPTOR *SecurityDescriptor)
 {
     NTSTATUS Status;
     FUSE_GETATTR_IN getattr_in;
     FUSE_GETATTR_OUT getattr_out;
 
-    DBG("fh: %Iu nodeid: %Iu", fh, nodeid);
-
     if ((FileInfo != NULL) && (SecurityDescriptor != NULL))
     {
         return STATUS_INVALID_PARAMETER;
     }
 
-    FUSE_HEADER_INIT(&getattr_in.hdr, FUSE_GETATTR, nodeid,
+    FUSE_HEADER_INIT(&getattr_in.hdr, FUSE_GETATTR, FileContext->NodeId,
         sizeof(getattr_in.getattr));
 
-    getattr_in.getattr.fh = fh;
-    getattr_in.getattr.getattr_flags = 0;
-    if (fh != 0)
+    if (FileContext->FileHandle != INVALID_FILE_HANDLE)
     {
+        getattr_in.getattr.fh = FileContext->FileHandle;
         getattr_in.getattr.getattr_flags |= FUSE_GETATTR_FH;
     }
+
+    getattr_in.getattr.getattr_flags = 0;
         
     Status = VirtFsFuseRequest(VirtFs->Device, &getattr_in,
         sizeof(getattr_in), &getattr_out, sizeof(getattr_out));
@@ -579,8 +641,8 @@ static NTSTATUS GetFileInfoInternal(VIRTFS *VirtFs, uint64_t nodeid,
         if (SecurityDescriptor != NULL)
         {
             Status = FspPosixMapPermissionsToSecurityDescriptor(
-                VirtFs->LocalUid, VirtFs->LocalGid, attr->mode,
-                SecurityDescriptor);
+                VirtFs->LocalUid, VirtFs->LocalGid,
+                ReadAndExecute(attr->mode), SecurityDescriptor);
         }
     }
 
@@ -663,7 +725,7 @@ static NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM *FileSystem, PWSTR FileName,
         }
 
         Status = FspPosixMapPermissionsToSecurityDescriptor(VirtFs->LocalUid,
-            VirtFs->LocalGid, attr->mode, &Security);
+            VirtFs->LocalGid, ReadAndExecute(attr->mode), &Security);
 
         if (NT_SUCCESS(Status))
         {
@@ -705,9 +767,11 @@ static NTSTATUS Create(FSP_FILE_SYSTEM *FileSystem, PWSTR FileName,
     VIRTFS *VirtFs = FileSystem->UserContext;
     VIRTFS_FILE_CONTEXT *FileContext;
     NTSTATUS Status;
-    UINT32 Mode = 0;
+    UINT32 Mode = 0664 /* -rw-rw-r-- */;
     char *filename, *fullpath;
     uint64_t parent;
+
+    UNREFERENCED_PARAMETER(SecurityDescriptor);
 
     DBG("\"%S\" CreateOptions: 0x%08x GrantedAccess: 0x%08x "
         "FileAttributes: 0x%08x AllocationSize: %Iu", FileName,
@@ -737,18 +801,11 @@ static NTSTATUS Create(FSP_FILE_SYSTEM *FileSystem, PWSTR FileName,
     }
 
     FileContext->IsDirectory = !!(CreateOptions & FILE_DIRECTORY_FILE);
+    FileContext->FileHandle = INVALID_FILE_HANDLE;
 
-    if (SecurityDescriptor != NULL)
+    if (!!(FileAttributes & FILE_ATTRIBUTE_READONLY) == TRUE)
     {
-        UINT32 Uid, Gid;
-
-        Status = FspPosixMapSecurityDescriptorToPermissions(
-            SecurityDescriptor, &Uid, &Gid, &Mode);
-
-        if (!NT_SUCCESS(Status))
-        {
-            Mode = 0400 | 0200; /* S_IRUSR | S_IWUSR */
-        }
+        Mode &= ~0222;
     }
 
     if (FileContext->IsDirectory == TRUE)
@@ -759,7 +816,7 @@ static NTSTATUS Create(FSP_FILE_SYSTEM *FileSystem, PWSTR FileName,
     else
     {
         Status = VirtFsCreateFile(VirtFs, FileContext, GrantedAccess,
-            filename, parent, Mode, FileInfo);
+            filename, parent, Mode, AllocationSize, FileInfo);
     }
 
     FspPosixDeletePath(fullpath);
@@ -810,30 +867,11 @@ static NTSTATUS Open(FSP_FILE_SYSTEM *FileSystem, PWSTR FileName,
         (FileContext->IsDirectory == TRUE) ? FUSE_OPENDIR : FUSE_OPEN,
         lookup_out.entry.nodeid, sizeof(open_in.open));
 
-    switch (GrantedAccess & (FILE_READ_DATA | FILE_WRITE_DATA))
-    {
-        case FILE_WRITE_DATA:
-            open_in.open.flags = O_WRONLY;
-            break;
-        case FILE_READ_DATA | FILE_WRITE_DATA:
-            open_in.open.flags = O_RDWR;
-            break;
-        case FILE_READ_DATA:
-            open_in.open.flags = O_RDONLY;
-            break;
-        default:
-            open_in.open.flags = 0;
-            break;
-    }
+    open_in.open.flags = AccessToUnixFlags(GrantedAccess);
 
     if (FileContext->IsDirectory == TRUE)
     {
         open_in.open.flags |= O_DIRECTORY;
-    }
-
-    if (GrantedAccess & FILE_APPEND_DATA)
-    {
-        open_in.open.flags |= O_APPEND;
     }
 
     Status = VirtFsFuseRequest(VirtFs->Device, &open_in, sizeof(open_in),
@@ -869,23 +907,33 @@ static NTSTATUS Overwrite(FSP_FILE_SYSTEM *FileSystem,
         "AllocationSize: %Iu", FileAttributes, ReplaceFileAttributes,
         AllocationSize);
 
-    if (ReplaceFileAttributes == FALSE)
+    if ((FileAttributes != 0) && (FileAttributes != INVALID_FILE_ATTRIBUTES))
     {
-        Status = GetFileInfoInternal(VirtFs, FileContext->NodeId,
-            FileContext->FileHandle, FileInfo, NULL);
-
-        if (!NT_SUCCESS(Status))
+        if (ReplaceFileAttributes == FALSE)
         {
-            return Status;
+            Status = GetFileInfoInternal(VirtFs, FileContext, FileInfo, NULL);
+            if (!NT_SUCCESS(Status))
+            {
+                return Status;
+            }
+
+            FileAttributes |= FileInfo->FileAttributes;
         }
 
-        FileAttributes |= FileInfo->FileAttributes;
+        if ((FileAttributes != FileInfo->FileAttributes))
+        {
+            Status = SetBasicInfo(FileSystem, FileContext0, FileAttributes,
+                0LL, 0LL, 0LL, 0LL, FileInfo);
+
+            if (!NT_SUCCESS(Status))
+            {
+                return Status;
+            }
+        }
     }
 
-    // XXX Call SetBasicInfo and SetFileSize?
-
-    return GetFileInfoInternal(VirtFs, FileContext->NodeId,
-        FileContext->FileHandle, FileInfo, NULL);
+    return SetFileSize(FileSystem, FileContext0, AllocationSize, FALSE,
+        FileInfo);
 }
 
 static VOID Close(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0)
@@ -926,6 +974,8 @@ static NTSTATUS Read(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
     DBG("Offset: %Iu Length: %u", Offset, Length);
     DBG("fh: %Iu nodeid: %Iu", FileContext->FileHandle, FileContext->NodeId);
 
+    *PBytesTransferred = 0;
+
     read_out = HeapAlloc(GetProcessHeap(), 0, sizeof(*read_out) + Length);
     if (read_out == NULL)
     {
@@ -946,30 +996,29 @@ static NTSTATUS Read(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
 
     if (!NT_SUCCESS(Status))
     {
-        if (PBytesTransferred != NULL)
-        {
-            *PBytesTransferred = 0;
-        }
         SafeHeapFree(read_out);
         return Status;
     }
 
-    if (PBytesTransferred != NULL)
+    *PBytesTransferred = read_out->hdr.len - sizeof(struct fuse_out_header);
+
+    // A successful read with no bytes read mean file offset is at or past the
+    // end of file.
+    if (*PBytesTransferred == 0)
     {
-        *PBytesTransferred = read_out->hdr.len -
-            sizeof(struct fuse_out_header);
-
-        if (Buffer != NULL)
-        {
-            CopyMemory(Buffer, read_out->buf, *PBytesTransferred);
-        }
-
-        DBG("BytesTransferred: %d", *PBytesTransferred);
+        Status = STATUS_END_OF_FILE;
     }
+
+    if (Buffer != NULL)
+    {
+        CopyMemory(Buffer, read_out->buf, *PBytesTransferred);
+    }
+
+    DBG("BytesTransferred: %d", *PBytesTransferred);
 
     SafeHeapFree(read_out);
 
-    return STATUS_SUCCESS;
+    return Status;
 }
 
 static NTSTATUS Write(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
@@ -989,16 +1038,23 @@ static NTSTATUS Write(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
         ConstrainedIo);
     DBG("fh: %Iu nodeid: %Iu", FileContext->FileHandle, FileContext->NodeId);
 
-    if (ConstrainedIo)
+    // Both these cases requires knowing the actual file size.
+    if ((WriteToEndOfFile == TRUE) || (ConstrainedIo == TRUE))
     {
-        Status = GetFileInfoInternal(VirtFs, FileContext->NodeId,
-            FileContext->FileHandle, FileInfo, NULL);
-
+        Status = GetFileInfoInternal(VirtFs, FileContext, FileInfo, NULL);
         if (!NT_SUCCESS(Status))
         {
             return Status;
         }
+    }
 
+    if (WriteToEndOfFile == TRUE)
+    {
+        Offset = FileInfo->FileSize;
+    }
+
+    if (ConstrainedIo == TRUE)
+    {
         if (Offset >= FileInfo->FileSize)
         {
             return STATUS_SUCCESS;
@@ -1054,8 +1110,7 @@ static NTSTATUS Write(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
         return Status;
     }
 
-    return GetFileInfoInternal(VirtFs, FileContext->NodeId,
-        FileContext->FileHandle, FileInfo, NULL);
+    return GetFileInfoInternal(VirtFs, FileContext, FileInfo, NULL);
 }
 
 static NTSTATUS Flush(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
@@ -1085,8 +1140,7 @@ static NTSTATUS Flush(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
         return Status;
     }
 
-    return GetFileInfoInternal(VirtFs, FileContext->NodeId,
-        FileContext->FileHandle, FileInfo, NULL);
+    return GetFileInfoInternal(VirtFs, FileContext, FileInfo, NULL);
 }
 
 static NTSTATUS GetFileInfo(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
@@ -1097,8 +1151,7 @@ static NTSTATUS GetFileInfo(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
 
     DBG("fh: %Iu nodeid: %Iu", FileContext->FileHandle, FileContext->NodeId);
 
-    return GetFileInfoInternal(VirtFs, FileContext->NodeId,
-        FileContext->FileHandle, FileInfo, NULL);
+    return GetFileInfoInternal(VirtFs, FileContext, FileInfo, NULL);
 }
 
 static NTSTATUS SetBasicInfo(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
@@ -1111,8 +1164,6 @@ static NTSTATUS SetBasicInfo(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
     FUSE_SETATTR_IN setattr_in;
     FUSE_SETATTR_OUT setattr_out;
 
-    UNREFERENCED_PARAMETER(FileAttributes);
-
     DBG("fh: %Iu nodeid: %Iu", FileContext->FileHandle, FileContext->NodeId);
 
     FUSE_HEADER_INIT(&setattr_in.hdr, FUSE_SETATTR, FileContext->NodeId,
@@ -1120,17 +1171,34 @@ static NTSTATUS SetBasicInfo(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
 
     ZeroMemory(&setattr_in.setattr, sizeof(setattr_in.setattr));
     
-    if (FileContext->FileHandle != 0)
+    if ((FileContext->IsDirectory == FALSE) &&
+        (FileContext->FileHandle != INVALID_FILE_HANDLE))
     {
-        setattr_in.setattr.valid = FATTR_FH;
+        setattr_in.setattr.valid |= FATTR_FH;
         setattr_in.setattr.fh = FileContext->FileHandle;
+    }
+
+    if (FileAttributes != INVALID_FILE_ATTRIBUTES)
+    {
+        setattr_in.setattr.valid |= FATTR_MODE;
+        setattr_in.setattr.mode = 0664 /* -rw-rw-r-- */;
+
+        if (!!(FileAttributes & FILE_ATTRIBUTE_READONLY) == TRUE)
+        {
+            setattr_in.setattr.mode &= ~0222;
+        }
+
+        if (!!(FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == TRUE)
+        {
+            setattr_in.setattr.mode |= 040111;
+        }
     }
 
     if (LastAccessTime != 0)
     {
         setattr_in.setattr.valid |= FATTR_ATIME;
-        FspPosixFileTimeToUnixTime(LastAccessTime,
-            (void *)&setattr_in.setattr.atime);
+        FileTimeToUnixTime(LastAccessTime, &setattr_in.setattr.atime,
+            &setattr_in.setattr.atimensec);
     }
     if ((LastWriteTime != 0) || (ChangeTime != 0))
     {
@@ -1139,14 +1207,14 @@ static NTSTATUS SetBasicInfo(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
             LastWriteTime = ChangeTime;
         }
         setattr_in.setattr.valid |= FATTR_MTIME;
-        FspPosixFileTimeToUnixTime(LastWriteTime,
-            (void *)&setattr_in.setattr.mtime);
+        FileTimeToUnixTime(LastWriteTime, &setattr_in.setattr.mtime,
+            &setattr_in.setattr.mtimensec);
     }
     if (CreationTime != 0)
     {
         setattr_in.setattr.valid |= FATTR_CTIME;
-        FspPosixFileTimeToUnixTime(CreationTime,
-            (void *)&setattr_in.setattr.ctime);
+        FileTimeToUnixTime(CreationTime, &setattr_in.setattr.ctime,
+            &setattr_in.setattr.ctimensec);
     }
 
     Status = VirtFsFuseRequest(VirtFs->Device, &setattr_in,
@@ -1157,8 +1225,7 @@ static NTSTATUS SetBasicInfo(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
         return Status;
     }
 
-    return GetFileInfoInternal(VirtFs, FileContext->NodeId,
-        FileContext->FileHandle, FileInfo, NULL);
+    return GetFileInfoInternal(VirtFs, FileContext, FileInfo, NULL);
 }
 
 static VOID Cleanup(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
@@ -1233,31 +1300,52 @@ static NTSTATUS SetFileSize(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
     VIRTFS *VirtFs = FileSystem->UserContext;
     VIRTFS_FILE_CONTEXT *FileContext = FileContext0;
     NTSTATUS Status;
-    FUSE_SETATTR_IN setattr_in;
-    FUSE_SETATTR_OUT setattr_out;
-
-    UNREFERENCED_PARAMETER(SetAllocationSize);
 
     DBG("NewSize: %Iu SetAllocationSize: %d", NewSize, SetAllocationSize);
     DBG("fh: %Iu nodeid: %Iu", FileContext->FileHandle, FileContext->NodeId);
 
-    FUSE_HEADER_INIT(&setattr_in.hdr, FUSE_SETATTR, FileContext->NodeId,
-        sizeof(setattr_in.setattr));
+    if (SetAllocationSize == TRUE)
+    {
+        FUSE_FALLOCATE_IN falloc_in;
+        FUSE_FALLOCATE_OUT falloc_out;
 
-    ZeroMemory(&setattr_in.setattr, sizeof(setattr_in.setattr));
-    setattr_in.setattr.valid = FATTR_SIZE;
-    setattr_in.setattr.size = NewSize;
+        FUSE_HEADER_INIT(&falloc_in.hdr, FUSE_FALLOCATE, FileContext->NodeId,
+            sizeof(struct fuse_fallocate_in));
 
-    Status = VirtFsFuseRequest(VirtFs->Device, &setattr_in,
-        sizeof(setattr_in), &setattr_out, sizeof(setattr_out));
+        falloc_in.hdr.uid = VirtFs->OwnerUid;
+        falloc_in.hdr.gid = VirtFs->OwnerGid;
+
+        falloc_in.falloc.fh = FileContext->FileHandle;
+        falloc_in.falloc.offset = 0;
+        falloc_in.falloc.length = NewSize;
+        falloc_in.falloc.mode = 0x01; /* FALLOC_FL_KEEP_SIZE */
+        falloc_in.falloc.padding = 0;
+
+        Status = VirtFsFuseRequest(VirtFs->Device, &falloc_in, falloc_in.hdr.len,
+            &falloc_out, sizeof(falloc_out));
+    }
+    else
+    {
+        FUSE_SETATTR_IN setattr_in;
+        FUSE_SETATTR_OUT setattr_out;
+
+        FUSE_HEADER_INIT(&setattr_in.hdr, FUSE_SETATTR, FileContext->NodeId,
+            sizeof(setattr_in.setattr));
+
+        ZeroMemory(&setattr_in.setattr, sizeof(setattr_in.setattr));
+        setattr_in.setattr.valid = FATTR_SIZE;
+        setattr_in.setattr.size = NewSize;
+
+        Status = VirtFsFuseRequest(VirtFs->Device, &setattr_in,
+            sizeof(setattr_in), &setattr_out, sizeof(setattr_out));
+    }
 
     if (!NT_SUCCESS(Status))
     {
         return Status;
     }
 
-    return GetFileInfoInternal(VirtFs, FileContext->NodeId,
-        FileContext->FileHandle, FileInfo, NULL);
+    return GetFileInfoInternal(VirtFs, FileContext, FileInfo, NULL);
 }
 
 static NTSTATUS CanDelete(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
@@ -1270,9 +1358,7 @@ static NTSTATUS CanDelete(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
 
     DBG("\"%S\"", FileName);
  
-    Status = GetFileInfoInternal(VirtFs, FileContext->NodeId,
-        FileContext->FileHandle, &FileInfo, NULL);
-
+    Status = GetFileInfoInternal(VirtFs, FileContext, &FileInfo, NULL);
     if (!NT_SUCCESS(Status))
     {
         return Status;
@@ -1293,7 +1379,7 @@ static NTSTATUS Rename(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
 {
     VIRTFS *VirtFs = FileSystem->UserContext;
     VIRTFS_FILE_CONTEXT *FileContext = FileContext0;
-    FUSE_RENAME_IN *rename_in;
+    FUSE_RENAME2_IN *rename2_in;
     FUSE_RENAME_OUT rename_out;
     NTSTATUS Status;
     char *oldname, *newname, *oldfullpath, *newfullpath;
@@ -1341,34 +1427,43 @@ static NTSTATUS Rename(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
     DBG("old: %s (%d) new: %s (%d)", oldname, oldname_size, newname,
         newname_size);
 
-    rename_in = HeapAlloc(GetProcessHeap(), 0, sizeof(*rename_in) +
+    rename2_in = HeapAlloc(GetProcessHeap(), 0, sizeof(*rename2_in) +
         oldname_size + newname_size);
 
-    if (rename_in == NULL)
+    if (rename2_in == NULL)
     {
         FspPosixDeletePath(oldfullpath);
         FspPosixDeletePath(newfullpath);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    FUSE_HEADER_INIT(&rename_in->hdr, FUSE_RENAME, oldparent,
-        sizeof(rename_in->rename) + oldname_size + newname_size);
+    FUSE_HEADER_INIT(&rename2_in->hdr, FUSE_RENAME2, oldparent,
+        sizeof(rename2_in->rename) + oldname_size + newname_size);
 
-    rename_in->rename.newdir = newparent;
+    rename2_in->rename.newdir = newparent;
 
-    CopyMemory(rename_in->names, oldname, oldname_size);
-    CopyMemory(rename_in->names + oldname_size, newname, newname_size);
+    // It is not allowed to rename to an existing directory even when
+    // ReplaceIfExists is set.
+    rename2_in->rename.flags = ((FileContext->IsDirectory == FALSE) &&
+        (ReplaceIfExists == TRUE)) ? 0 : (1 << 0) /* RENAME_NOREPLACE */;
+
+    CopyMemory(rename2_in->names, oldname, oldname_size);
+    CopyMemory(rename2_in->names + oldname_size, newname, newname_size);
 
     FspPosixDeletePath(oldfullpath);
     FspPosixDeletePath(newfullpath);
 
-    if (ReplaceIfExists == TRUE)
+    Status = VirtFsFuseRequest(VirtFs->Device, rename2_in,
+        rename2_in->hdr.len, &rename_out, sizeof(rename_out));
+
+    // Fix to expected error when renaming a directory to existing directory.
+    if ((FileContext->IsDirectory == TRUE) && (ReplaceIfExists == TRUE) &&
+        (Status == STATUS_OBJECT_NAME_COLLISION))
     {
-        // XXX check Linux's behavior and fix to match.
+        Status = STATUS_ACCESS_DENIED;
     }
 
-    return VirtFsFuseRequest(VirtFs->Device, rename_in,
-        rename_in->hdr.len, &rename_out, sizeof(rename_out));
+    return Status;
 }
 
 static NTSTATUS GetSecurity(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
@@ -1382,9 +1477,7 @@ static NTSTATUS GetSecurity(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
 
     DBG("fh: %Iu nodeid: %Iu", FileContext->FileHandle, FileContext->NodeId);
 
-    Status = GetFileInfoInternal(VirtFs, FileContext->NodeId,
-        FileContext->FileHandle, NULL, &Security);
-
+    Status = GetFileInfoInternal(VirtFs, FileContext, NULL, &Security);
     if (!NT_SUCCESS(Status))
     {
         *PSecurityDescriptorSize = 0;
@@ -1422,9 +1515,7 @@ static NTSTATUS SetSecurity(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
 
     DBG("fh: %Iu nodeid: %Iu", FileContext->FileHandle, FileContext->NodeId);
 
-    Status = GetFileInfoInternal(VirtFs, FileContext->NodeId,
-        FileContext->FileHandle, NULL, &FileSecurity);
-
+    Status = GetFileInfoInternal(VirtFs, FileContext, NULL, &FileSecurity);
     if (!NT_SUCCESS(Status))
     {
         SafeHeapFree(FileSecurity);

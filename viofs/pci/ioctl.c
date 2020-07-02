@@ -225,6 +225,7 @@ static VOID HandleGetVolumeName(IN PDEVICE_CONTEXT Context,
     {
         TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL,
             "WdfRequestRetrieveOutputBuffer failed");
+        WdfRequestComplete(Request, status);
         return;
     }
 
@@ -250,8 +251,7 @@ static VOID HandleSubmitFuseRequest(IN PDEVICE_CONTEXT Context,
         goto complete_wdf_req_no_fs_req;
     }
 
-    if ((OutputBufferLength > 0) &&
-        (OutputBufferLength < sizeof(struct fuse_out_header)))
+    if (OutputBufferLength < sizeof(struct fuse_out_header))
     {
         TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "Insufficient out buffer");
         status = STATUS_BUFFER_TOO_SMALL;
@@ -293,15 +293,10 @@ static VOID HandleSubmitFuseRequest(IN PDEVICE_CONTEXT Context,
     fs_req->Request = Request;
     fs_req->InputBuffer = VirtFsAllocatePages(InputBufferLength);
     fs_req->InputBufferLength = InputBufferLength;
+    fs_req->OutputBuffer = VirtFsAllocatePages(OutputBufferLength);
+    fs_req->OutputBufferLength = OutputBufferLength;
 
-    if (OutputBufferLength > 0)
-    {
-        fs_req->OutputBuffer = VirtFsAllocatePages(OutputBufferLength);
-        fs_req->OutputBufferLength = OutputBufferLength;
-    }
-
-    if ((fs_req->InputBuffer == NULL) ||
-        ((OutputBufferLength > 0) && (fs_req->OutputBuffer == NULL)))
+    if ((fs_req->InputBuffer == NULL) || (fs_req->OutputBuffer == NULL))
     {
         TraceEvents(TRACE_LEVEL_ERROR, DBG_IOCTL, "Data allocation failed");
         status = STATUS_INSUFFICIENT_RESOURCES;
@@ -373,6 +368,7 @@ VOID VirtFsEvtIoDeviceControl(IN WDFQUEUE Queue,
             break;
 
         default:
+            WdfRequestComplete(Request, STATUS_INVALID_DEVICE_REQUEST);
             break;
     }
 
@@ -383,10 +379,18 @@ VOID VirtFsEvtIoStop(IN WDFQUEUE Queue,
                      IN WDFREQUEST Request,
                      IN ULONG ActionFlags)
 {
-    UNREFERENCED_PARAMETER(Queue);
+    PDEVICE_CONTEXT context = GetDeviceContext(WdfIoQueueGetDevice(Queue));
 
     TraceEvents(TRACE_LEVEL_VERBOSE, DBG_IOCTL,
-        "--> %!FUNC! Request: %p", Request);
+        "--> %!FUNC! Request: %p ActionFlags: 0x%08x", Request, ActionFlags);
+
+    if (ActionFlags & WdfRequestStopRequestCancelable)
+    {
+        if (WdfRequestUnmarkCancelable(Request) == STATUS_CANCELLED)
+        {
+            goto request_cancelled;
+        }
+    }
 
     if (ActionFlags & WdfRequestStopActionSuspend)
     {
@@ -394,12 +398,29 @@ VOID VirtFsEvtIoStop(IN WDFQUEUE Queue,
     }
     else if (ActionFlags & WdfRequestStopActionPurge)
     {
-        if (WdfRequestUnmarkCancelable(Request) != STATUS_CANCELLED)
+        PSINGLE_LIST_ENTRY iter;
+
+        WdfSpinLockAcquire(context->RequestsLock);
+        iter = &context->RequestsList;
+        while (iter->Next != NULL)
         {
-            WdfRequestComplete(Request , STATUS_CANCELLED);
-        }
+            PVIRTIO_FS_REQUEST removed = CONTAINING_RECORD(iter->Next,
+                VIRTIO_FS_REQUEST, ListEntry);
+
+            if (Request == removed->Request)
+            {
+                removed->Request = NULL;
+                break;
+            }
+
+            iter = iter->Next;
+        };
+        WdfSpinLockRelease(context->RequestsLock);
+
+        WdfRequestComplete(Request, STATUS_CANCELLED);
     }
 
+request_cancelled:
     TraceEvents(TRACE_LEVEL_VERBOSE, DBG_IOCTL, "<-- %!FUNC!");
 }
 
