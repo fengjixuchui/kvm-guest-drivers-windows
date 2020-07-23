@@ -40,6 +40,7 @@ sdkddkver.h before ntddk.h cause compilation failure in wdm.h and ntddk.h */
 #include "ParaNdis_Debug.h"
 #include "ParaNdis_DebugHistory.h"
 #include "ParaNdis6_Driver.h"
+#include "ParaNdis_Protocol.h"
 #include "Trace.h"
 #ifdef NETKVM_WPP_ENABLED
 #include "ParaNdis6_Driver.tmh"
@@ -72,8 +73,19 @@ ULONG bDisableMSI = FALSE;
 
 static NDIS_HANDLE      DriverHandle;
 static LONG             gID = 0;
+static bool             ProtocolActive;
 static tRunTimeNdisVersion _ParandisVersion;
 const tRunTimeNdisVersion& ParandisVersion = _ParandisVersion;
+
+static bool FORCEINLINE IsProtocolActive(PARANDIS_ADAPTER *pContext)
+{
+    static const bool UseStandByFeature = false;
+    if (!UseStandByFeature)
+    {
+        return ProtocolActive;
+    }
+    return virtio_is_feature_enabled(pContext->u64GuestFeatures, VIRTIO_NET_F_STANDBY);
+}
 
 static const char *ConnectStateName(NDIS_MEDIA_CONNECT_STATE state)
 {
@@ -379,8 +391,15 @@ static NDIS_STATUS ParaNdis6_Initialize(
 
     if (pContext && status == NDIS_STATUS_SUCCESS)
     {
-        pContext->m_StateMachine.NotifyInitialized();
+        pContext->m_StateMachine.NotifyInitialized(pContext);
         ParaNdis_DebugRegisterMiniport(pContext, TRUE);
+        ParaNdis_ProtocolRegisterAdapter(pContext);
+    }
+    else
+    {
+        // In rare case of initialization failure we need to unregister the protocol.
+        // Use dummy adapter context
+        ParaNdis_ProtocolUnregisterAdapter();
     }
 
     DEBUG_EXIT_STATUS(status ? 0 : 2, status);
@@ -397,6 +416,7 @@ static VOID ParaNdis6_Halt(NDIS_HANDLE miniportAdapterContext, NDIS_HALT_ACTION 
     PARANDIS_ADAPTER *pContext = (PARANDIS_ADAPTER *)miniportAdapterContext;
     DEBUG_ENTRY(0);
     ParaNdis_DebugHistory(pContext, hopHalt, NULL, 1, haltAction, 0);
+    ParaNdis_ProtocolUnregisterAdapter(pContext);
     ParaNdis_CleanupContext(pContext);
     ParaNdis_DebugHistory(pContext, hopHalt, NULL, 0, 0, 0);
     ParaNdis_DebugRegisterMiniport(pContext, FALSE);
@@ -414,6 +434,9 @@ static VOID ParaNdis6_Unload(IN PDRIVER_OBJECT pDriverObject)
     if (DriverHandle) NdisMDeregisterMiniportDriver(DriverHandle);
     DEBUG_EXIT_STATUS(2, 0);
     ParaNdis_DebugCleanup(pDriverObject);
+    /* Happens only in very special test with driver verifier, but needed */
+    ParaNdis_ProtocolUnregisterAdapter();
+
 #ifdef NETKVM_WPP_ENABLED
     WPP_CLEANUP(pDriverObject);
 #endif // WPP
@@ -465,6 +488,10 @@ static VOID ParaNdis6_SendNetBufferLists(
     PARANDIS_ADAPTER *pContext = (PARANDIS_ADAPTER *)miniportAdapterContext;
     UNREFERENCED_PARAMETER(portNumber);
     UNREFERENCED_PARAMETER(flags);
+    if (IsProtocolActive(pContext) && ParaNdis_ProtocolSend(pContext, pNBL))
+    {
+        return;
+    }
 #ifdef PARANDIS_SUPPORT_RSS
     CNdisPassiveReadAutoLock autoLock(pContext->RSSParameters.rwLock);
     if (pContext->RSS2QueueMap != nullptr)
@@ -488,6 +515,69 @@ static VOID ParaNdis6_SendNetBufferLists(
 #else
     pContext->pPathBundles[0].txPath.Send(pNBL);
 #endif
+}
+
+/**********************************************************
+NDIS procedure of returning us buffer of previously indicated packets
+Parameters:
+    context
+    PNET_BUFFER_LIST pNBL - list of buffers to free
+    returnFlags - is dpc
+
+The procedure frees:
+received buffer descriptors back to list of RX buffers
+all the allocated MDL structures
+all the received NBLs back to our pool
+***********************************************************/
+VOID ParaNdis6_ReturnNetBufferLists(
+    NDIS_HANDLE miniportAdapterContext,
+    PNET_BUFFER_LIST pNBL,
+    ULONG returnFlags)
+{
+    PARANDIS_ADAPTER *pContext = (PARANDIS_ADAPTER *)miniportAdapterContext;
+    PNET_BUFFER_LIST netkvmHead = NULL, sriovHead = NULL;
+    PNET_BUFFER_LIST *netkvmTail = &netkvmHead, *sriovTail = &sriovHead;
+    ULONG nofNetkvm = 0, nofSriov = 0;
+
+    DEBUG_ENTRY(5);
+
+    if (!IsProtocolActive(pContext))
+    {
+        nofNetkvm = ParaNdis_CountNBLs(pNBL);
+        ParaNdis_ReuseRxNBLs(pNBL);
+        pContext->m_RxStateMachine.UnregisterOutstandingItems(nofNetkvm);
+        return;
+    }
+
+    while (pNBL)
+    {
+        PNET_BUFFER_LIST next = NET_BUFFER_LIST_NEXT_NBL(pNBL);
+        if (pNBL->NdisPoolHandle == pContext->BufferListsPool)
+        {
+            *netkvmTail = pNBL;
+            netkvmTail = &NET_BUFFER_LIST_NEXT_NBL(pNBL);
+            nofNetkvm++;
+        }
+        else
+        {
+            *sriovTail = pNBL;
+            sriovTail = &NET_BUFFER_LIST_NEXT_NBL(pNBL);
+            nofSriov++;
+        }
+        NET_BUFFER_LIST_NEXT_NBL(pNBL) = NULL;
+        pNBL = next;
+    }
+
+    if (nofNetkvm)
+    {
+        ParaNdis_ReuseRxNBLs(netkvmHead);
+        pContext->m_RxStateMachine.UnregisterOutstandingItems(nofNetkvm);
+    }
+
+    if (nofSriov)
+    {
+        ParaNdis_ProtocolReturnNbls(pContext, sriovHead, nofSriov, returnFlags);
+    }
 }
 
 /**********************************************************
@@ -1133,10 +1223,32 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pRegistryPath
         WPP_CLEANUP(pDriverObject);
 #endif // WPP
     }
+    if (NT_SUCCESS(status))
+    {
+        ParaNdis_ProtocolInitialize(DriverHandle);
+    }
     return status;
+}
+
+VOID ParaNdis_ProtocolActive()
+{
+    ProtocolActive = true;
 }
 
 VOID ParaNdis6_SendNBLInternal(NDIS_HANDLE miniportAdapterContext, PNET_BUFFER_LIST pNBL, NDIS_PORT_NUMBER portNumber, ULONG flags)
 {
     ParaNdis6_SendNetBufferLists(miniportAdapterContext, pNBL, portNumber, flags);
+}
+
+void CBindingToSriov::Notify(SMNotifications msg)
+{
+    PARANDIS_ADAPTER *pContext = (PARANDIS_ADAPTER *)m_Context;
+    if (msg == SMNotifications::PoweredOn)
+    {
+        ParaNdis_ProtocolRegisterAdapter(pContext);
+    }
+    if (msg == SMNotifications::PoweringOff)
+    {
+        ParaNdis_ProtocolUnregisterAdapter(pContext, false);
+    }
 }

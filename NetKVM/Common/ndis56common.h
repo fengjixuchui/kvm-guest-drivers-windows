@@ -84,10 +84,6 @@ extern "C"
 #define _Function_class_(x)
 #endif
 
-#if defined(_ARM64_)
-#define NETKVM_COPY_RX_DATA
-#endif
-
 typedef struct _tagRunTimeNdisVersion
 {
     UCHAR major;
@@ -829,6 +825,8 @@ ULONG ParaNdis_StripVlanHeaderMoveHead(PNET_PACKET_INFO packetInfo);
 VOID ParaNdis_PadPacketToMinimalLength(PNET_PACKET_INFO packetInfo);
 BOOLEAN ParaNdis_IsSendPossible(PARANDIS_ADAPTER *pContext);
 NDIS_STATUS ParaNdis_ExactSendFailureStatus(PARANDIS_ADAPTER *pContext);
+
+VOID ParaNdis_PropagateOid(PARANDIS_ADAPTER *pContext, NDIS_OID oid, PVOID buffer, UINT length);
 
 void ParaNdis_PrintIndirectionTable(const NDIS_RECEIVE_SCALE_PARAMETERS* Params);
 #endif

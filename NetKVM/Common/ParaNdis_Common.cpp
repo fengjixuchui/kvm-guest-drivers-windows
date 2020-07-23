@@ -410,6 +410,7 @@ static void DumpVirtIOFeatures(PPARANDIS_ADAPTER pContext)
         {VIRTIO_NET_F_RSC_EXT, "VIRTIO_NET_F_RSC_EXT" },
         {VIRTIO_NET_F_RSS, "VIRTIO_NET_F_RSS" },
         {VIRTIO_NET_F_HASH_REPORT, "VIRTIO_NET_F_HASH_REPORT" },
+        {VIRTIO_NET_F_STANDBY, "VIRTIO_NET_F_STANDBY" },
     };
     UINT i;
     for (i = 0; i < sizeof(Features)/sizeof(Features[0]); ++i)
@@ -769,6 +770,7 @@ NDIS_STATUS ParaNdis_InitializeContext(
 #if (WINVER == 0x0A00)
         AckFeature(pContext, VIRTIO_F_IOMMU_PLATFORM);
 #endif
+        AckFeature(pContext, VIRTIO_NET_F_STANDBY);
 
         pContext->bLinkDetectSupported = AckFeature(pContext, VIRTIO_NET_F_STATUS);
         if(pContext->bLinkDetectSupported) {
@@ -782,12 +784,7 @@ NDIS_STATUS ParaNdis_InitializeContext(
         }
 
         InitializeLinkPropertiesConfig(pContext);
-
-#if !defined(_ARM64_)
         pContext->bControlQueueSupported = AckFeature(pContext, VIRTIO_NET_F_CTRL_VQ);
-#else
-        DPrintf(0, "[%s] Control queue disabled for ARM64\n", __FUNCTION__);
-#endif
         pContext->bGuestAnnounceSupported = pContext->bLinkDetectSupported && pContext->bControlQueueSupported && AckFeature(pContext, VIRTIO_NET_F_GUEST_ANNOUNCE);
         InitializeMAC(pContext, CurrentMAC);
         InitializeMaxMTUConfig(pContext);
