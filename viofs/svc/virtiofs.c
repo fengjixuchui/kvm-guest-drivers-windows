@@ -46,7 +46,7 @@
 #include <sys/stat.h>
 #include <wtsapi32.h>
 
-#include "virtfs.h"
+#include "virtiofs.h"
 #include "fusereq.h"
 
 #define FS_SERVICE_NAME TEXT("VirtIO-FS")
@@ -337,7 +337,7 @@ static VOID SetFileInfo(struct fuse_attr *attr, FSP_FSCTL_FILE_INFO *FileInfo)
     FileInfo->HardLinks = 0;
     FileInfo->EaSize = 0;
 
-    DBG("ino=%Iu size=%Iu blocks=%Iu atime=%Iu mtime=%Iu ctime=%Iu "
+    DBG("ino=%I64u size=%I64u blocks=%I64u atime=%I64u mtime=%I64u ctime=%I64u "
         "atimensec=%u mtimensec=%u ctimensec=%u mode=%x nlink=%u uid=%u "
         "gid=%u rdev=%u blksize=%u", attr->ino, attr->size, attr->blocks,
         attr->atime, attr->mtime, attr->ctime, attr->atimensec,
@@ -354,7 +354,7 @@ static NTSTATUS VirtFsFuseRequest(HANDLE Device, LPVOID InBuffer,
     struct fuse_in_header *in_hdr = InBuffer;
     struct fuse_out_header *out_hdr = OutBuffer;
 
-    DBG(">>req: %d unique: %Iu len: %u", in_hdr->opcode, in_hdr->unique,
+    DBG(">>req: %d unique: %I64u len: %u", in_hdr->opcode, in_hdr->unique,
         in_hdr->len);
 
     Result = DeviceIoControl(Device, IOCTL_VIRTFS_FUSE_REQUEST,
@@ -366,7 +366,7 @@ static NTSTATUS VirtFsFuseRequest(HANDLE Device, LPVOID InBuffer,
         return FspNtStatusFromWin32(GetLastError());
     }
 
-    DBG("<<len: %u error: %d unique: %Iu", out_hdr->len, out_hdr->error,
+    DBG("<<len: %u error: %d unique: %I64u", out_hdr->len, out_hdr->error,
         out_hdr->unique);
 
     if (BytesReturned != out_hdr->len)
@@ -533,8 +533,8 @@ static NTSTATUS SubmitLookupRequest(HANDLE Device, uint64_t parent,
     {
         struct fuse_attr *attr = &LookupOut->entry.attr;
 
-        DBG("nodeid=%Iu ino=%Iu size=%Iu blocks=%Iu atime=%Iu mtime=%Iu "
-            "ctime=%Iu atimensec=%u mtimensec=%u ctimensec=%u mode=%x "
+        DBG("nodeid=%I64u ino=%I64u size=%I64u blocks=%I64u atime=%I64u mtime=%I64u "
+            "ctime=%I64u atimensec=%u mtimensec=%u ctimensec=%u mode=%x "
             "nlink=%u uid=%u gid=%u rdev=%u blksize=%u",
             LookupOut->entry.nodeid, attr->ino, attr->size, attr->blocks,
             attr->atime, attr->mtime, attr->ctime, attr->atimensec,
@@ -774,7 +774,7 @@ static NTSTATUS Create(FSP_FILE_SYSTEM *FileSystem, PWSTR FileName,
     UNREFERENCED_PARAMETER(SecurityDescriptor);
 
     DBG("\"%S\" CreateOptions: 0x%08x GrantedAccess: 0x%08x "
-        "FileAttributes: 0x%08x AllocationSize: %Iu", FileName,
+        "FileAttributes: 0x%08x AllocationSize: %I64u", FileName,
         CreateOptions, GrantedAccess, FileAttributes, AllocationSize);
 
     Status = FspPosixMapWindowsToPosixPath(FileName + 1, &fullpath);
@@ -886,7 +886,7 @@ static NTSTATUS Open(FSP_FILE_SYSTEM *FileSystem, PWSTR FileName,
     FileContext->NodeId = lookup_out.entry.nodeid;
     FileContext->FileHandle = open_out.open.fh;
     
-    DBG("fh: %Iu nodeid: %Iu", FileContext->FileHandle, FileContext->NodeId);
+    DBG("fh: %I64u nodeid: %I64u", FileContext->FileHandle, FileContext->NodeId);
 
     SetFileInfo(&lookup_out.entry.attr, FileInfo);
     
@@ -904,7 +904,7 @@ static NTSTATUS Overwrite(FSP_FILE_SYSTEM *FileSystem,
     NTSTATUS Status;
 
     DBG("FileAttributes: 0x%08x ReplaceFileAttributes: %d "
-        "AllocationSize: %Iu", FileAttributes, ReplaceFileAttributes,
+        "AllocationSize: %I64u", FileAttributes, ReplaceFileAttributes,
         AllocationSize);
 
     if ((FileAttributes != 0) && (FileAttributes != INVALID_FILE_ATTRIBUTES))
@@ -943,7 +943,7 @@ static VOID Close(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0)
     FUSE_RELEASE_IN release_in;
     FUSE_RELEASE_OUT release_out;
 
-    DBG("fh: %Iu nodeid: %Iu", FileContext->FileHandle, FileContext->NodeId);
+    DBG("fh: %I64u nodeid: %I64u", FileContext->FileHandle, FileContext->NodeId);
 
     FUSE_HEADER_INIT(&release_in.hdr,
         FileContext->IsDirectory ? FUSE_RELEASEDIR : FUSE_RELEASE,
@@ -971,8 +971,8 @@ static NTSTATUS Read(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
     FUSE_READ_OUT *read_out;
     NTSTATUS Status;
 
-    DBG("Offset: %Iu Length: %u", Offset, Length);
-    DBG("fh: %Iu nodeid: %Iu", FileContext->FileHandle, FileContext->NodeId);
+    DBG("Offset: %I64u Length: %u", Offset, Length);
+    DBG("fh: %I64u nodeid: %I64u", FileContext->FileHandle, FileContext->NodeId);
 
     *PBytesTransferred = 0;
 
@@ -1033,10 +1033,10 @@ static NTSTATUS Write(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
     FUSE_WRITE_IN *write_in;
     FUSE_WRITE_OUT write_out;
 
-    DBG("Buffer: %p Offset: %Iu Length: %u WriteToEndOfFile: %d "
+    DBG("Buffer: %p Offset: %I64u Length: %u WriteToEndOfFile: %d "
         "ConstrainedIo: %d", Buffer, Offset, Length, WriteToEndOfFile,
         ConstrainedIo);
-    DBG("fh: %Iu nodeid: %Iu", FileContext->FileHandle, FileContext->NodeId);
+    DBG("fh: %I64u nodeid: %I64u", FileContext->FileHandle, FileContext->NodeId);
 
     // Both these cases requires knowing the actual file size.
     if ((WriteToEndOfFile == TRUE) || (ConstrainedIo == TRUE))
@@ -1122,7 +1122,7 @@ static NTSTATUS Flush(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
     FUSE_FLUSH_IN flush_in;
     FUSE_FLUSH_OUT flush_out;
 
-    DBG("fh: %Iu nodeid: %Iu", FileContext->FileHandle, FileContext->NodeId);
+    DBG("fh: %I64u nodeid: %I64u", FileContext->FileHandle, FileContext->NodeId);
 
     FUSE_HEADER_INIT(&flush_in.hdr, FUSE_FLUSH, FileContext->NodeId,
         sizeof(flush_in.flush));
@@ -1149,7 +1149,7 @@ static NTSTATUS GetFileInfo(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
     VIRTFS *VirtFs = FileSystem->UserContext;
     VIRTFS_FILE_CONTEXT *FileContext = FileContext0;
 
-    DBG("fh: %Iu nodeid: %Iu", FileContext->FileHandle, FileContext->NodeId);
+    DBG("fh: %I64u nodeid: %I64u", FileContext->FileHandle, FileContext->NodeId);
 
     return GetFileInfoInternal(VirtFs, FileContext, FileInfo, NULL);
 }
@@ -1164,7 +1164,7 @@ static NTSTATUS SetBasicInfo(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
     FUSE_SETATTR_IN setattr_in;
     FUSE_SETATTR_OUT setattr_out;
 
-    DBG("fh: %Iu nodeid: %Iu", FileContext->FileHandle, FileContext->NodeId);
+    DBG("fh: %I64u nodeid: %I64u", FileContext->FileHandle, FileContext->NodeId);
 
     FUSE_HEADER_INIT(&setattr_in.hdr, FUSE_SETATTR, FileContext->NodeId,
         sizeof(setattr_in.setattr));
@@ -1301,8 +1301,8 @@ static NTSTATUS SetFileSize(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
     VIRTFS_FILE_CONTEXT *FileContext = FileContext0;
     NTSTATUS Status;
 
-    DBG("NewSize: %Iu SetAllocationSize: %d", NewSize, SetAllocationSize);
-    DBG("fh: %Iu nodeid: %Iu", FileContext->FileHandle, FileContext->NodeId);
+    DBG("NewSize: %I64u SetAllocationSize: %d", NewSize, SetAllocationSize);
+    DBG("fh: %I64u nodeid: %I64u", FileContext->FileHandle, FileContext->NodeId);
 
     if (SetAllocationSize == TRUE)
     {
@@ -1388,7 +1388,7 @@ static NTSTATUS Rename(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
 
     DBG("\"%S\" -> \"%S\" ReplaceIfExist: %d", FileName, NewFileName,
         ReplaceIfExists);
-    DBG("fh: %Iu nodeid: %Iu", FileContext->FileHandle, FileContext->NodeId);
+    DBG("fh: %I64u nodeid: %I64u", FileContext->FileHandle, FileContext->NodeId);
 
     Status = FspPosixMapWindowsToPosixPath(FileName + 1, &oldfullpath);
     if (!NT_SUCCESS(Status))
@@ -1475,7 +1475,7 @@ static NTSTATUS GetSecurity(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
     DWORD SecurityLength;
     NTSTATUS Status;
 
-    DBG("fh: %Iu nodeid: %Iu", FileContext->FileHandle, FileContext->NodeId);
+    DBG("fh: %I64u nodeid: %I64u", FileContext->FileHandle, FileContext->NodeId);
 
     Status = GetFileInfoInternal(VirtFs, FileContext, NULL, &Security);
     if (!NT_SUCCESS(Status))
@@ -1513,7 +1513,7 @@ static NTSTATUS SetSecurity(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
     UINT32 Uid, Gid, Mode, NewMode;
     NTSTATUS Status;
 
-    DBG("fh: %Iu nodeid: %Iu", FileContext->FileHandle, FileContext->NodeId);
+    DBG("fh: %I64u nodeid: %I64u", FileContext->FileHandle, FileContext->NodeId);
 
     Status = GetFileInfoInternal(VirtFs, FileContext, NULL, &FileSecurity);
     if (!NT_SUCCESS(Status))
@@ -1638,7 +1638,7 @@ static NTSTATUS ReadDirectory(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
 
                 while (Remains > sizeof(struct fuse_direntplus))
                 {
-                    DBG("ino=%Iu off=%Iu namelen=%u type=%u name=%s",
+                    DBG("ino=%I64u off=%I64u namelen=%u type=%u name=%s",
                         DirEntryPlus->dirent.ino, DirEntryPlus->dirent.off,
                         DirEntryPlus->dirent.namelen,
                         DirEntryPlus->dirent.type, DirEntryPlus->dirent.name);
@@ -1734,12 +1734,11 @@ static NTSTATUS SvcStart(FSP_SERVICE *Service, ULONG argc, PWSTR *argv)
     else goto usage
 
     wchar_t **argp, **arge;
-    WCHAR VolumePrefix[MAX_PATH];
     FSP_FSCTL_VOLUME_PARAMS VolumeParams;
     PWSTR DebugLogFile = 0;
     ULONG DebugFlags = 0;
     HANDLE DebugLogHandle = INVALID_HANDLE_VALUE;
-    PWSTR MountPoint = NULL;
+    PWSTR MountPoint = TEXT("*");
     VIRTFS *VirtFs;
     DWORD SessionId;
     FILETIME FileTime;
@@ -1763,6 +1762,9 @@ static NTSTATUS SvcStart(FSP_SERVICE *Service, ULONG argc, PWSTR *argv)
                 break;
             case L'D':
                 argtos(DebugLogFile);
+                break;
+            case L'm':
+                argtos(MountPoint);
                 break;
             default:
                 goto usage;
@@ -1810,10 +1812,6 @@ static NTSTATUS SvcStart(FSP_SERVICE *Service, ULONG argc, PWSTR *argv)
         return Status;
     }
 
-    lstrcpy(VolumePrefix, L"\\VirtioFS\\");
-    GetVolumeName(VirtFs->Device, VolumePrefix + lstrlen(VolumePrefix),
-        sizeof(VolumePrefix) - (lstrlen(VolumePrefix) * sizeof(WCHAR)));
-
     FUSE_HEADER_INIT(&init_in.hdr, FUSE_INIT, FUSE_ROOT_ID,
         sizeof(init_in.init));
 
@@ -1857,15 +1855,10 @@ static NTSTATUS SvcStart(FSP_SERVICE *Service, ULONG argc, PWSTR *argv)
     VolumeParams.FlushAndPurgeOnCleanup = 1;
     VolumeParams.UmFileContextIsUserContext2 = 1;
 //    VolumeParams.DirectoryMarkerAsNextOffset = 1;
-    if (VolumePrefix != NULL)
-    {
-        wcscpy_s(VolumeParams.Prefix,
-            sizeof(VolumeParams.Prefix) / sizeof(WCHAR), VolumePrefix);
-    }
     wcscpy_s(VolumeParams.FileSystemName,
         sizeof(VolumeParams.FileSystemName) / sizeof(WCHAR), FS_SERVICE_NAME);
 
-    Status = FspFileSystemCreate(TEXT(FSP_FSCTL_NET_DEVICE_NAME),
+    Status = FspFileSystemCreate(TEXT(FSP_FSCTL_DISK_DEVICE_NAME),
         &VolumeParams, &VirtFsInterface, &VirtFs->FileSystem);
 
     if (!NT_SUCCESS(Status))
@@ -1878,10 +1871,17 @@ static NTSTATUS SvcStart(FSP_SERVICE *Service, ULONG argc, PWSTR *argv)
 
     VirtFs->FileSystem->UserContext = Service->UserContext = VirtFs;
 
-    Status = FspFileSystemSetMountPoint(VirtFs->FileSystem, MountPoint);
+    Status = FspFileSystemSetMountPoint(VirtFs->FileSystem,
+        (lstrcmp(MountPoint, TEXT("*")) == 0) ? NULL : MountPoint);
+
     if (NT_SUCCESS(Status))
     {
         Status = FspFileSystemStartDispatcher(VirtFs->FileSystem, 0);
+    }
+    else
+    {
+        FspServiceLog(EVENTLOG_ERROR_TYPE,
+            TEXT("Failed to mount virtio-fs file system."));
     }
 
     if (!NT_SUCCESS(Status))
@@ -1897,7 +1897,8 @@ usage:
         "\n"
         "options:\n"
         "    -d DebugFlags       [-1: enable all debug logs]\n"
-        "    -D DebugLogFile     [file path; use - for stderr]\n";
+        "    -D DebugLogFile     [file path; use - for stderr]\n"
+        "    -m MountPoint       [X:|* (required if no UNC prefix)]\n";
 
     FspServiceLog(EVENTLOG_ERROR_TYPE, usage, FS_SERVICE_NAME);
 
