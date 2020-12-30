@@ -15,7 +15,7 @@ extern "C"
 
 class CNB;
 class CTXVirtQueue;
-typedef struct _tagPARANDIS_ADAPTER *PPARANDIS_ADAPTER;
+typedef struct _PARANDIS_ADAPTER *PPARANDIS_ADAPTER;
 
 typedef enum
 {
@@ -237,6 +237,8 @@ public:
     //TODO: Needs review/temporary?
     void DisableInterrupts()
     { virtqueue_disable_cb(m_VirtQueue); }
+
+    bool IsValid() const { return m_VirtQueue != nullptr; }
 
 protected:
     NDIS_HANDLE m_DrvHandle;

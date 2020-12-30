@@ -65,7 +65,7 @@ NTSTATUS DriverEntry(IN PDRIVER_OBJECT  DriverObject,
     WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
     attributes.EvtCleanupCallback = VIOSockEvtDriverContextCleanup;
 
-    WDF_DRIVER_CONFIG_INIT(&config,VIOSockEvtDeviceAdd);
+    WDF_DRIVER_CONFIG_INIT(&config, VIOSockEvtDeviceAdd);
     config.DriverPoolTag  = VIOSOCK_DRIVER_MEMORY_TAG;
 
     status = WdfDriverCreate(DriverObject,
@@ -81,7 +81,7 @@ NTSTATUS DriverEntry(IN PDRIVER_OBJECT  DriverObject,
         return status;
     }
 
-    TraceEvents(TRACE_LEVEL_INFORMATION, DBG_INIT, "<-- %s\n", __FUNCTION__);
+    TraceEvents(TRACE_LEVEL_VERBOSE, DBG_INIT, "<-- %s\n", __FUNCTION__);
     return status;
 }
 
@@ -97,3 +97,44 @@ VIOSockEvtDriverContextCleanup(
     WPP_CLEANUP(WdfDriverWdmGetDriverObject((WDFDRIVER)Driver));
 }
 
+VOID
+VIOSockTimerStart(
+    IN PVIOSOCK_TIMER   pTimer,
+    IN LONGLONG         Timeout
+)
+{
+    LARGE_INTEGER liTicks;
+    BOOLEAN bSetTimer = FALSE;
+
+    if (!Timeout || Timeout == LONGLONG_MAX)
+        return;
+
+    ASSERT(Timeout > VIOSOCK_TIMER_TOLERANCE);
+    if (Timeout <= VIOSOCK_TIMER_TOLERANCE)
+        Timeout = VIOSOCK_TIMER_TOLERANCE + 1;
+
+    KeQueryTickCount(&liTicks);
+
+    ++pTimer->StartRefs;
+
+    if (pTimer->StartTime)
+    {
+        LONGLONG Remaining;
+
+        ASSERT(pTimer->Timeout);
+
+        Remaining = pTimer->Timeout -
+            (liTicks.QuadPart - pTimer->StartTime) * KeQueryTimeIncrement();
+        if (Remaining > Timeout + VIOSOCK_TIMER_TOLERANCE)
+            bSetTimer = TRUE;
+    }
+    else
+        bSetTimer = TRUE;
+
+    if (bSetTimer)
+    {
+        pTimer->StartTime = liTicks.QuadPart;
+        pTimer->Timeout = Timeout;
+        WdfTimerStart(pTimer->Timer, -Timeout);
+    }
+}

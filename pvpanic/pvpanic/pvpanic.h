@@ -34,9 +34,11 @@
 
 // The bit of supported PV event.
 #define PVPANIC_F_PANICKED      0
+#define PVPANIC_F_CRASHLOADED   1
 
 // The PV event value.
 #define PVPANIC_PANICKED        (1 << PVPANIC_F_PANICKED)
+#define PVPANIC_CRASHLOADED     (1 << PVPANIC_F_CRASHLOADED)
 
 // Name of the symbolic link object exposed in the guest.
 // The file name visible to user space is "\\.\PVPanicDevice".
@@ -44,6 +46,10 @@
 
 // IOCTLs supported by the symbolic link object.
 #define IOCTL_GET_CRASH_DUMP_HEADER CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
+
+PUCHAR PvPanicPortAddress;
+BOOLEAN bEmitCrashLoadedEvent;
+BOOLEAN bSupportCrashLoaded;
 
 typedef struct _DEVICE_CONTEXT {
 

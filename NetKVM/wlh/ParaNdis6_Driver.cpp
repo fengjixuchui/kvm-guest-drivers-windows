@@ -162,23 +162,14 @@ static NDIS_STATUS ParaNdis6_Initialize(
 {
     NDIS_MINIPORT_ADAPTER_ATTRIBUTES        miniportAttributes = {};
     NDIS_STATUS  status = NDIS_STATUS_SUCCESS;
-    PARANDIS_ADAPTER *pContext = nullptr;
-    PVOID UnalignedAdapterContext = nullptr;
-    ULONG UnalignedAdapterContextSize;
+    PARANDIS_ADAPTER *pContext;
 
     UNREFERENCED_PARAMETER(miniportDriverContext);
     DEBUG_ENTRY(0);
-    /* allocate context structure and align it to cache boundary */
-    UnalignedAdapterContextSize = sizeof(PARANDIS_ADAPTER) + NdisGetSharedDataAlignment();
 
-    UnalignedAdapterContext =
-        NdisAllocateMemoryWithTagPriority(
-            miniportAdapterHandle,
-            UnalignedAdapterContextSize,
-            PARANDIS_MEMORY_TAG,
-            NormalPoolPriority);
+    pContext = new (miniportAdapterHandle) PARANDIS_ADAPTER;
 
-    if (!UnalignedAdapterContext)
+    if (!pContext)
     {
         DPrintf(0, "[%s] ERROR: Memory allocation failed!\n", __FUNCTION__);
         status = NDIS_STATUS_RESOURCES;
@@ -186,28 +177,16 @@ static NDIS_STATUS ParaNdis6_Initialize(
 
     if (status == NDIS_STATUS_SUCCESS)
     {
-        NdisZeroMemory(UnalignedAdapterContext, UnalignedAdapterContextSize);
-
-        pContext = (PARANDIS_ADAPTER *)ALIGN_UP_POINTER_BY(UnalignedAdapterContext, NdisGetSharedDataAlignment());
-
         /* This call is for Static Driver Verifier only - has no real functionality*/
         __sdv_save_adapter_context((PVOID*)&pContext);
-
-        pContext->UnalignedAdapterContext = UnalignedAdapterContext;
-        pContext->UnalignedAdapterContextSize = UnalignedAdapterContextSize;
 
         /* set mandatory fields which Common use */
         pContext->ulUniqueID = NdisInterlockedIncrement(&gID);
         pContext->DriverHandle = DriverHandle;
         pContext->MiniportHandle = miniportAdapterHandle;
 
-        new (&pContext->m_StateMachine) CMiniportStateMachine;
-        new (&pContext->m_RxStateMachine) CDataFlowStateMachine;
-        new (&pContext->m_CxStateMachine) CConfigFlowStateMachine;
-
         pContext->m_StateMachine.RegisterFlow(pContext->m_RxStateMachine);
         pContext->m_StateMachine.RegisterFlow(pContext->m_CxStateMachine);
-
 
         NdisZeroMemory(&miniportAttributes, sizeof(miniportAttributes));
         miniportAttributes.RegistrationAttributes.Header.Type = NDIS_OBJECT_TYPE_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES;
@@ -301,25 +280,8 @@ static NDIS_STATUS ParaNdis6_Initialize(
         {
             miniportAttributes.GeneralAttributes.RecvScaleCapabilities =
                 ParaNdis6_RSSCreateConfiguration(pContext);
-            pContext->bRSSInitialized = TRUE;
         }
-
-        new (&pContext->RSSParameters.rwLock) CNdisRWLock();
-        if (!pContext->RSSParameters.rwLock.Create(pContext->MiniportHandle))
-        {
-            DPrintf(0, "RSS RW lock allocation failed\n");
-            status = NDIS_STATUS_RESOURCES;
-        }
-
-        for(ULONG i = 0; i < ARRAYSIZE(pContext->ReceiveQueues); i++)
-        {
-            NdisAllocateSpinLock(&pContext->ReceiveQueues[i].Lock);
-            InitializeListHead(&pContext->ReceiveQueues[i].BuffersList);
-        }
-
-        pContext->ReceiveQueuesInitialized = TRUE;
 #endif
-
         miniportAttributes.GeneralAttributes.AccessType = NET_IF_ACCESS_BROADCAST;
         miniportAttributes.GeneralAttributes.DirectionType = NET_IF_DIRECTION_SENDRECEIVE;
         miniportAttributes.GeneralAttributes.IfType = IF_TYPE_ETHERNET_CSMACD;
@@ -341,29 +303,11 @@ static NDIS_STATUS ParaNdis6_Initialize(
 
     if (pContext && status != NDIS_STATUS_SUCCESS && status != NDIS_STATUS_PENDING)
     {
-#if PARANDIS_SUPPORT_RSS
-        pContext->RSSParameters.rwLock.~CNdisRWLock();
-
-        if (pContext->ReceiveQueuesInitialized)
-        {
-            ULONG i;
-
-            for (i = 0; i < ARRAYSIZE(pContext->ReceiveQueues); i++)
-            {
-                NdisFreeSpinLock(&pContext->ReceiveQueues[i].Lock);
-            }
-        }
-#endif
-
         pContext->m_StateMachine.UnregisterFlow(pContext->m_RxStateMachine);
         pContext->m_StateMachine.UnregisterFlow(pContext->m_CxStateMachine);
         pContext->m_StateMachine.NotifyHalted();
 
-        pContext->m_CxStateMachine.~CConfigFlowStateMachine();
-        pContext->m_RxStateMachine.~CDataFlowStateMachine();
-        pContext->m_StateMachine.~CMiniportStateMachine();
-
-        NdisFreeMemory(pContext->UnalignedAdapterContext, 0, 0);
+        pContext->Destroy(pContext, pContext->MiniportHandle);
         pContext = NULL;
     }
 
@@ -372,8 +316,7 @@ static NDIS_STATUS ParaNdis6_Initialize(
         status = ParaNdis_FinishInitialization(pContext);
         if (status != NDIS_STATUS_SUCCESS)
         {
-            ParaNdis_CleanupContext(pContext);
-            NdisFreeMemory(pContext->UnalignedAdapterContext, 0, 0);
+            pContext->Destroy(pContext, pContext->MiniportHandle);
             pContext = NULL;
         }
     }
@@ -417,10 +360,9 @@ static VOID ParaNdis6_Halt(NDIS_HANDLE miniportAdapterContext, NDIS_HALT_ACTION 
     DEBUG_ENTRY(0);
     ParaNdis_DebugHistory(pContext, hopHalt, NULL, 1, haltAction, 0);
     ParaNdis_ProtocolUnregisterAdapter(pContext);
-    ParaNdis_CleanupContext(pContext);
     ParaNdis_DebugHistory(pContext, hopHalt, NULL, 0, 0, 0);
     ParaNdis_DebugRegisterMiniport(pContext, FALSE);
-    NdisFreeMemory(pContext->UnalignedAdapterContext, 0, 0);
+    pContext->Destroy(pContext, pContext->MiniportHandle);
     DEBUG_EXIT_STATUS(2, 0);
 }
 

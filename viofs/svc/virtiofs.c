@@ -649,6 +649,55 @@ static NTSTATUS GetFileInfoInternal(VIRTFS *VirtFs,
     return Status;
 }
 
+static NTSTATUS IsEmptyDirectory(FSP_FILE_SYSTEM *FileSystem,
+    PVOID FileContext0)
+{
+    VIRTFS *VirtFs = FileSystem->UserContext;
+    VIRTFS_FILE_CONTEXT *FileContext = FileContext0;
+    BYTE ReadOutBuf[0x1000];
+    struct fuse_dirent *DirEntry;
+    NTSTATUS Status = STATUS_SUCCESS;
+    UINT32 Entries;
+    UINT32 Remains;
+    FUSE_READ_IN read_in;
+    FUSE_READ_OUT *read_out = (FUSE_READ_OUT *)ReadOutBuf;
+
+    FUSE_HEADER_INIT(&read_in.hdr, FUSE_READDIR, FileContext->NodeId,
+        sizeof(read_in.read));
+
+    read_in.read.fh = FileContext->FileHandle;
+    read_in.read.offset = 0;
+    read_in.read.size = sizeof(ReadOutBuf) - sizeof(struct fuse_out_header);
+    read_in.read.read_flags = 0;
+    read_in.read.lock_owner = 0;
+    read_in.read.flags = 0;
+
+    Status = VirtFsFuseRequest(VirtFs->Device, &read_in, sizeof(read_in),
+        read_out, sizeof(struct fuse_out_header) + read_in.read.size);
+
+    if (NT_SUCCESS(Status))
+    {
+        Entries = 0;
+        Remains = read_out->hdr.len - sizeof(struct fuse_out_header);
+        DirEntry = (struct fuse_dirent *)read_out->buf;
+
+        while (Remains > sizeof(struct fuse_dirent))
+        {
+            if (++Entries > 2)
+            {
+                Status = STATUS_DIRECTORY_NOT_EMPTY;
+                break;
+            }
+
+            Remains -= FUSE_DIRENT_SIZE(DirEntry);
+            DirEntry = (struct fuse_dirent *)((PBYTE)DirEntry +
+                FUSE_DIRENT_SIZE(DirEntry));
+        }
+    }
+
+    return Status;
+}
+
 static VOID GetVolumeName(HANDLE Device, PWSTR VolumeName,
     DWORD VolumeNameSize)
 {
@@ -1302,27 +1351,38 @@ static NTSTATUS SetFileSize(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
     NTSTATUS Status;
 
     DBG("NewSize: %I64u SetAllocationSize: %d", NewSize, SetAllocationSize);
-    DBG("fh: %I64u nodeid: %I64u", FileContext->FileHandle, FileContext->NodeId);
+    DBG("fh: %I64u nodeid: %I64u", FileContext->FileHandle,
+        FileContext->NodeId);
 
     if (SetAllocationSize == TRUE)
     {
-        FUSE_FALLOCATE_IN falloc_in;
-        FUSE_FALLOCATE_OUT falloc_out;
+        if (NewSize > 0)
+        {
+            FUSE_FALLOCATE_IN falloc_in;
+            FUSE_FALLOCATE_OUT falloc_out;
 
-        FUSE_HEADER_INIT(&falloc_in.hdr, FUSE_FALLOCATE, FileContext->NodeId,
-            sizeof(struct fuse_fallocate_in));
+            FUSE_HEADER_INIT(&falloc_in.hdr, FUSE_FALLOCATE,
+                FileContext->NodeId, sizeof(struct fuse_fallocate_in));
 
-        falloc_in.hdr.uid = VirtFs->OwnerUid;
-        falloc_in.hdr.gid = VirtFs->OwnerGid;
+            falloc_in.hdr.uid = VirtFs->OwnerUid;
+            falloc_in.hdr.gid = VirtFs->OwnerGid;
 
-        falloc_in.falloc.fh = FileContext->FileHandle;
-        falloc_in.falloc.offset = 0;
-        falloc_in.falloc.length = NewSize;
-        falloc_in.falloc.mode = 0x01; /* FALLOC_FL_KEEP_SIZE */
-        falloc_in.falloc.padding = 0;
+            falloc_in.falloc.fh = FileContext->FileHandle;
+            falloc_in.falloc.offset = 0;
+            falloc_in.falloc.length = NewSize;
+            falloc_in.falloc.mode = 0x01; /* FALLOC_FL_KEEP_SIZE */
+            falloc_in.falloc.padding = 0;
 
-        Status = VirtFsFuseRequest(VirtFs->Device, &falloc_in, falloc_in.hdr.len,
-            &falloc_out, sizeof(falloc_out));
+            Status = VirtFsFuseRequest(VirtFs->Device, &falloc_in,
+                falloc_in.hdr.len, &falloc_out, sizeof(falloc_out));
+        }
+        else
+        {
+            // fallocate on host fails when len is less than or equal to 0.
+            // So ignore the request and report success. This fix a failure
+            // to create a new file through Windows Explorer.
+            Status = STATUS_SUCCESS;
+        }
     }
     else
     {
@@ -1351,24 +1411,14 @@ static NTSTATUS SetFileSize(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
 static NTSTATUS CanDelete(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
     PWSTR FileName)
 {
-    VIRTFS *VirtFs = FileSystem->UserContext;
     PVIRTFS_FILE_CONTEXT FileContext = FileContext0;
-    FSP_FSCTL_FILE_INFO FileInfo;
-    NTSTATUS Status;
+    NTSTATUS Status = STATUS_SUCCESS;
 
     DBG("\"%S\"", FileName);
- 
-    Status = GetFileInfoInternal(VirtFs, FileContext, &FileInfo, NULL);
-    if (!NT_SUCCESS(Status))
-    {
-        return Status;
-    }
 
-    // Would be nice to know why the size of an empty directory is 40.
-    if ((FileInfo.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
-        (FileInfo.FileSize > 40))
+    if (FileContext->IsDirectory == TRUE)
     {
-        return STATUS_DIRECTORY_NOT_EMPTY;
+        Status = IsEmptyDirectory(FileSystem, FileContext0);
     }
 
     return Status;
@@ -1946,6 +1996,10 @@ static NTSTATUS SvcControl(FSP_SERVICE *Service, ULONG Control,
 
 int wmain(int argc, wchar_t **argv)
 {
+    FSP_SERVICE *Service;
+    NTSTATUS Result;
+    ULONG ExitCode;
+
     UNREFERENCED_PARAMETER(argc);
     UNREFERENCED_PARAMETER(argv);
 
@@ -1954,5 +2008,29 @@ int wmain(int argc, wchar_t **argv)
         return ERROR_DELAY_LOAD_FAILED;
     }
 
-    return FspServiceRun(FS_SERVICE_NAME, SvcStart, SvcStop, SvcControl);
+    Result = FspServiceCreate(FS_SERVICE_NAME, SvcStart, SvcStop, SvcControl,
+        &Service);
+
+    if (!NT_SUCCESS(Result))
+    {
+        FspServiceLog(EVENTLOG_ERROR_TYPE,
+            L"The service %s cannot be created (Status=%lx).",
+            FS_SERVICE_NAME, Result);
+        return FspWin32FromNtStatus(Result);
+    }
+    FspServiceAllowConsoleMode(Service);
+    FspServiceAcceptControl(Service, SERVICE_ACCEPT_SESSIONCHANGE);
+    Result = FspServiceLoop(Service);
+    ExitCode = FspServiceGetExitCode(Service);
+    FspServiceDelete(Service);
+
+    if (!NT_SUCCESS(Result))
+    {
+        FspServiceLog(EVENTLOG_ERROR_TYPE,
+            L"The service %s has failed to run (Status=%lx).",
+            FS_SERVICE_NAME, Result);
+        return FspWin32FromNtStatus(Result);
+    }
+
+    return ExitCode;
 }

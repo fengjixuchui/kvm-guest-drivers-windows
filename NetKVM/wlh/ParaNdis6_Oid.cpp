@@ -129,7 +129,7 @@ OIDENTRY(OID_GEN_TRANSMIT_BLOCK_SIZE,           2,0,4, ohfQueryStat     ),
 OIDENTRY(OID_GEN_RECEIVE_BLOCK_SIZE,            2,0,4, ohfQueryStat     ),
 OIDENTRY(OID_GEN_VENDOR_ID,                     2,0,4, ohfQueryStat     ),
 OIDENTRY(OID_GEN_VENDOR_DESCRIPTION,            2,2,4, ohfQueryStat     ),
-OIDENTRYPROC(OID_GEN_CURRENT_PACKET_FILTER,     2,0,4, ohfQuerySet | ohfSetPropagate, ParaNdis_OnSetPacketFilter),
+OIDENTRYPROC(OID_GEN_CURRENT_PACKET_FILTER,     2,0,4, ohfQuerySet | ohfSetPropagatePre, ParaNdis_OnSetPacketFilter),
 OIDENTRYPROC(OID_GEN_CURRENT_LOOKAHEAD,         2,0,4, ohfQuerySet, ParaNdis_OnSetLookahead),
 OIDENTRY(OID_GEN_DRIVER_VERSION,                2,0,4, ohfQuery         ),
 OIDENTRY(OID_GEN_MAXIMUM_TOTAL_SIZE,            2,0,4, ohfQueryStat     ),
@@ -176,7 +176,7 @@ OIDENTRYPROC(OID_PNP_REMOVE_WAKE_UP_PATTERN,    2,0,4, ohfSet,          ParaNdis
 OIDENTRYPROC(OID_PNP_ENABLE_WAKE_UP,            2,0,4, ohfQuerySet,     ParaNdis_OnEnableWakeup),
 OIDENTRY(OID_802_3_PERMANENT_ADDRESS,           2,0,4, ohfQueryStat     ),
 OIDENTRY(OID_802_3_CURRENT_ADDRESS,             2,0,4, ohfQueryStat     ),
-OIDENTRYPROC(OID_802_3_MULTICAST_LIST,          2,0,4, ohfQuerySet | ohfSetPropagate, ParaNdis_OnOidSetMulticastList),
+OIDENTRYPROC(OID_802_3_MULTICAST_LIST,          2,0,4, ohfQuerySet | ohfSetPropagatePre, ParaNdis_OnOidSetMulticastList),
 OIDENTRY(OID_802_3_MAXIMUM_LIST_SIZE,           2,0,4, ohfQueryStat     ),
 OIDENTRY(OID_802_3_MAC_OPTIONS,                 2,4,4, 0                ),
 OIDENTRY(OID_802_3_RCV_ERROR_ALIGNMENT,         2,4,4, ohfQueryStat3264 ),
@@ -197,14 +197,14 @@ OIDENTRYPROC(OID_GEN_INTERRUPT_MODERATION,      2,4,4, ohfQueryStat | ohfSet, On
 OIDENTRYPROC(OID_GEN_LINK_PARAMETERS,           2,0,4, ohfSet, OnSetLinkParameters),
 OIDENTRY(OID_IP4_OFFLOAD_STATS,                 4,4,4, 0),
 OIDENTRY(OID_IP6_OFFLOAD_STATS,                 4,4,4, 0),
-OIDENTRYPROC(OID_TCP_OFFLOAD_PARAMETERS,        0,0,0, ohfSet | ohfSetMoreOK | ohfSetLessOK, OnSetOffloadParameters),
-OIDENTRYPROC(OID_OFFLOAD_ENCAPSULATION,         0,0,0, ohfQuerySet, OnSetOffloadEncapsulation),
+OIDENTRYPROC(OID_TCP_OFFLOAD_PARAMETERS,        0,0,0, ohfSet | ohfSetMoreOK | ohfSetLessOK | ohfSetPropagatePost, OnSetOffloadParameters),
+OIDENTRYPROC(OID_OFFLOAD_ENCAPSULATION,         0,0,0, ohfQuerySet | ohfSetPropagatePost, OnSetOffloadEncapsulation),
 OIDENTRYPROC(OID_VENDOR_1,                      0,0,0, ohfQueryStat | ohfSet | ohfSetMoreOK, OnSetVendorSpecific1),
 OIDENTRYPROC(OID_VENDOR_2,                      0,0,0, ohfQueryStat | ohfSet | ohfSetMoreOK, OnSetVendorSpecific2),
 OIDENTRYPROC(OID_VENDOR_3,                      0,0,0, ohfQueryStat | ohfSet | ohfSetMoreOK, OnSetVendorSpecific3),
 
 #if PARANDIS_SUPPORT_RSS
-    OIDENTRYPROC(OID_GEN_RECEIVE_SCALE_PARAMETERS,  0,0,0, ohfSet | ohfSetMoreOK, RSSSetParameters),
+    OIDENTRYPROC(OID_GEN_RECEIVE_SCALE_PARAMETERS,  0,0,0, ohfSet | ohfSetPropagatePost | ohfSetMoreOK, RSSSetParameters),
     OIDENTRYPROC(OID_GEN_RECEIVE_HASH,              0,0,0, ohfQuerySet | ohfSetMoreOK, RSSSetReceiveHash),
 #endif
 #if PARANDIS_SUPPORT_RSC
@@ -213,11 +213,11 @@ OIDENTRYPROC(OID_VENDOR_3,                      0,0,0, ohfQueryStat | ohfSet | o
 
 #if NDIS_SUPPORT_NDIS620
 // here should be NDIS 6.20 specific OIDs (mostly power management related)
-// OID_PM_CURRENT_CAPABILITIES - not requred, supported by NDIS
+// OID_PM_CURRENT_CAPABILITIES - not required, supported by NDIS
 // OID_PM_PARAMETERS - mandatory
 // OID_PM_ADD_WOL_PATTERN - mandatory
 // OID_PM_REMOVE_WOL_PATTERN - mandatory
-// OID_PM_WOL_PATTERN_LIST - not requred, supported by NDIS
+// OID_PM_WOL_PATTERN_LIST - not required, supported by NDIS
 // OID_PM_ADD_PROTOCOL_OFFLOAD - mandatory
 // OID_PM_GET_PROTOCOL_OFFLOAD - mandatory
 // OID_PM_REMOVE_PROTOCOL_OFFLOAD - mandatory
@@ -596,11 +596,15 @@ NDIS_STATUS ParaNdis6_OidRequest(
                     _oid.pBytesRead = &pNdisRequest->DATA.SET_INFORMATION.BytesRead;
                     // if we need to propagate the OID we need to do that before we
                     // call original handler to be sure the original request is still alive
-                    if (Rules.Flags & ohfSetPropagate)
+                    if (Rules.Flags & ohfSetPropagatePre)
                     {
                         ParaNdis_PropagateOid(pContext, _oid.Oid, _oid.InformationBuffer, _oid.InformationBufferLength);
                     }
                     status = Rules.OidSetProc(pContext, &_oid);
+                    if (Rules.Flags & ohfSetPropagatePost && status == STATUS_SUCCESS)
+                    {
+                        ParaNdis_PropagateOid(pContext, _oid.Oid, NULL, 0);
+                    }
                 }
                 else
                 {

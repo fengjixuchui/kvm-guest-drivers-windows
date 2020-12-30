@@ -92,7 +92,7 @@ typedef struct _tagConfigurationEntries
     tConfigurationEntry stdLsoV2ip6;
     tConfigurationEntry PriorityVlanTagging;
     tConfigurationEntry VlanId;
-    tConfigurationEntry MTU;
+    tConfigurationEntry JumboPacket;
     tConfigurationEntry NumberOfHandledRXPacketsInDPC;
 #if PARANDIS_SUPPORT_RSS
     tConfigurationEntry RSSOffloadSupported;
@@ -125,7 +125,7 @@ static const tConfigurationEntries defaultConfiguration =
     { "*LsoV2IPv6", 1, 0, 1 },
     { "*PriorityVLANTag", 3, 0, 3},
     { "VlanId", 0, 0, MAX_VLAN_ID},
-    { "MTU", 1500, 576, 65500},
+    { "*JumboPacket", 1514, 590, 65500},
     { "NumberOfHandledRXPacketsInDPC", MAX_RX_LOOPS, 1, 10000},
 #if PARANDIS_SUPPORT_RSS
     { "*RSS", 1, 0, 1},
@@ -254,7 +254,7 @@ static void ReadNicConfiguration(PARANDIS_ADAPTER *pContext, PUCHAR pNewMACAddre
             GetConfigurationEntry(cfg, &pConfiguration->stdLsoV2ip6);
             GetConfigurationEntry(cfg, &pConfiguration->PriorityVlanTagging);
             GetConfigurationEntry(cfg, &pConfiguration->VlanId);
-            GetConfigurationEntry(cfg, &pConfiguration->MTU);
+            GetConfigurationEntry(cfg, &pConfiguration->JumboPacket);
             GetConfigurationEntry(cfg, &pConfiguration->NumberOfHandledRXPacketsInDPC);
 #if PARANDIS_SUPPORT_RSS
             GetConfigurationEntry(cfg, &pConfiguration->RSSOffloadSupported);
@@ -300,7 +300,7 @@ static void ReadNicConfiguration(PARANDIS_ADAPTER *pContext, PUCHAR pNewMACAddre
             pContext->InitialOffloadParameters.LsoV2IPv6 = (UCHAR)pConfiguration->stdLsoV2ip6.ulValue;
             pContext->ulPriorityVlanSetting = pConfiguration->PriorityVlanTagging.ulValue;
             pContext->VlanId = pConfiguration->VlanId.ulValue & 0xfff;
-            pContext->MaxPacketSize.nMaxDataSize = pConfiguration->MTU.ulValue;
+            pContext->MaxPacketSize.nMaxDataSize = pConfiguration->JumboPacket.ulValue - ETH_HEADER_SIZE;
 #if PARANDIS_SUPPORT_RSS
             pContext->bRSSOffloadSupported = pConfiguration->RSSOffloadSupported.ulValue ? TRUE : FALSE;
             pContext->RSSMaxQueuesNumber = (CCHAR) pConfiguration->NumRSSQueues.ulValue;
@@ -712,9 +712,7 @@ Initializes the context structure
 Major variables, received from NDIS on initialization, must be be set before this call
 (for ex. pContext->MiniportHandle)
 
-If this procedure fails, no need to call
-    ParaNdis_CleanupContext
-
+If this procedure fails, it is safe to call ParaNdis_CleanupContext
 
 Parameters:
 Return value:
@@ -732,11 +730,14 @@ NDIS_STATUS ParaNdis_InitializeContext(
 
     DEBUG_ENTRY(0);
 
+    if (pContext->RSSParameters.FailedInitialization)
+    {
+        return NDIS_STATUS_RESOURCES;
+    }
+
     ReadNicConfiguration(pContext, CurrentMAC);
 
     pContext->fCurrentLinkState = MediaConnectStateUnknown;
-
-    new (&pContext->guestAnnouncePackets) CGuestAnnouncePackets(pContext);
 
     if (pContext->PciResources.Init(pContext->MiniportHandle, pResourceList))
     {
@@ -766,9 +767,9 @@ NDIS_STATUS ParaNdis_InitializeContext(
         pContext->u64HostFeatures = virtio_get_features(&pContext->IODevice);
         DumpVirtIOFeatures(pContext);
 
-        // Enable VIRTIO_F_IOMMU_PLATFORM feature on Windows 10 and Windows Server 2016
+        // Enable VIRTIO_F_ACCESS_PLATFORM feature on Windows 10 and Windows Server 2016
 #if (WINVER == 0x0A00)
-        AckFeature(pContext, VIRTIO_F_IOMMU_PLATFORM);
+        AckFeature(pContext, VIRTIO_F_ACCESS_PLATFORM);
 #endif
         AckFeature(pContext, VIRTIO_NET_F_STANDBY);
 
@@ -1041,9 +1042,7 @@ static NDIS_STATUS ParaNdis_VirtIONetInit(PARANDIS_ADAPTER *pContext)
         return NTStatusToNdisStatus(nt_status);
     }
 
-    new (&pContext->CXPath) CParaNdisCX();
-    pContext->bCXPathAllocated = TRUE;
-    if (pContext->bControlQueueSupported && pContext->CXPath.Create(pContext, 2 * pContext->nHardwareQueues))
+    if (pContext->bControlQueueSupported && pContext->CXPath.Create(2 * pContext->nHardwareQueues))
     {
         pContext->bCXPathCreated = TRUE;
     }
@@ -1053,7 +1052,6 @@ static NDIS_STATUS ParaNdis_VirtIONetInit(PARANDIS_ADAPTER *pContext)
         pContext->bCtrlRXFiltersSupported = pContext->bCtrlRXExtraFiltersSupported = FALSE;
         pContext->bCtrlMACAddrSupported = pContext->bCtrlVLANFiltersSupported = FALSE;
         pContext->bCXPathCreated = FALSE;
-
     }
 
     pContext->pPathBundles = (CPUPathBundle *)NdisAllocateMemoryWithTagPriority(pContext->MiniportHandle, pContext->nPathBundles * sizeof(*pContext->pPathBundles),
@@ -1352,7 +1350,7 @@ Frees all the resources allocated when the context initialized,
 Parameters:
     context
 ***********************************************************/
-VOID ParaNdis_CleanupContext(PARANDIS_ADAPTER *pContext)
+static VOID ParaNdis_CleanupContext(PARANDIS_ADAPTER *pContext)
 {
     /* disable any interrupt generation */
     if (pContext->bDeviceInitialized)
@@ -1370,37 +1368,9 @@ VOID ParaNdis_CleanupContext(PARANDIS_ADAPTER *pContext)
     ParaNdis_SetLinkState(pContext, MediaConnectStateUnknown);
     VirtIONetRelease(pContext);
 
-    pContext->guestAnnouncePackets.~CGuestAnnouncePackets();
-
     ParaNdis_FinalizeCleanup(pContext);
 
-#ifdef PARANDIS_SUPPORT_RSS
-    if (pContext->ReceiveQueuesInitialized)
-    {
-        ULONG i;
-
-        for(i = 0; i < ARRAYSIZE(pContext->ReceiveQueues); i++)
-        {
-            NdisFreeSpinLock(&pContext->ReceiveQueues[i].Lock);
-        }
-    }
-#endif
-
-#if PARANDIS_SUPPORT_RSS
-    if (pContext->bRSSInitialized)
-    {
-        ParaNdis6_RSSCleanupConfiguration(&pContext->RSSParameters);
-    }
-
-    pContext->RSSParameters.rwLock.~CNdisRWLock();
-#endif
     pContext->m_StateMachine.NotifyHalted();
-
-    if (pContext->bCXPathAllocated)
-    {
-        pContext->CXPath.~CParaNdisCX();
-        pContext->bCXPathAllocated = false;
-    }
 
     if (pContext->pPathBundles != NULL)
     {
@@ -1423,7 +1393,6 @@ VOID ParaNdis_CleanupContext(PARANDIS_ADAPTER *pContext)
 
     virtio_device_shutdown(&pContext->IODevice);
 
-    pContext->PciResources.~CPciResources();
 }
 
 
@@ -2203,4 +2172,10 @@ tChecksumCheckResult ParaNdis_CheckRxChecksum(
 void ParaNdis_PrintCharArray(int DebugPrintLevel, const CCHAR *data, size_t length)
 {
     ParaNdis_PrintTable<80, 10>(DebugPrintLevel, data, length, "%d", [](const CCHAR *p) {  return *p; });
+}
+
+_PARANDIS_ADAPTER::~_PARANDIS_ADAPTER()
+{
+    guestAnnouncePackets.Clear();
+    ParaNdis_CleanupContext(this);
 }

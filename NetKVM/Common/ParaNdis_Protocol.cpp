@@ -40,6 +40,8 @@
 #include "ParaNdis_Protocol.tmh"
 #endif
 
+#define GUESS_VERSION(a, b) (a) = max((a), (b))
+
 static PVOID ParaNdis_ReferenceBinding(PARANDIS_ADAPTER *pContext)
 {
     return pContext->m_StateMachine.ReferenceSriovBinding();
@@ -49,6 +51,51 @@ static void ParaNdis_DereferenceBinding(PARANDIS_ADAPTER *pContext)
 {
     pContext->m_StateMachine.DereferenceSriovBinding();
 }
+
+static void TracePnpId(PDEVICE_OBJECT pdo, PARANDIS_ADAPTER *Adapter)
+{
+    if (!pdo)
+    {
+        return;
+    }
+    ULONG length = 0;
+    NTSTATUS status = IoGetDeviceProperty(pdo, DevicePropertyHardwareID, 0, NULL, &length);
+    if (!length)
+    {
+        return;
+    }
+    char *buffer = (char *)ParaNdis_AllocateMemory(Adapter, length);
+    if (!buffer)
+    {
+        return;
+    }
+    status = IoGetDeviceProperty(pdo, DevicePropertyHardwareID, length, buffer, &length);
+    if (NT_SUCCESS(status))
+    {
+        TraceNoPrefix(0, "PnpId %S", (LPCWSTR)buffer);
+    }
+    NdisFreeMemory(buffer, 0, 0);
+}
+
+class CInternalNblEntry : public CNdisAllocatable<CInternalNblEntry, 'NORP'>
+{
+public:
+    CInternalNblEntry(PNET_BUFFER_LIST Nbl) : m_Nbl(Nbl), m_KeepReserved(Nbl->MiniportReserved[0]) { }
+    bool Match(PNET_BUFFER_LIST Nbl)
+    {
+        if (Nbl == m_Nbl)
+        {
+            Nbl->MiniportReserved[0] = m_KeepReserved;
+            TraceNoPrefix(0, "[%s] restored %p:%p\n", __FUNCTION__, Nbl, m_KeepReserved);
+            return true;
+        }
+        return false;
+    }
+private:
+    PVOID m_KeepReserved;
+    PNET_BUFFER_LIST m_Nbl;
+    DECLARE_CNDISLIST_ENTRY(CInternalNblEntry);
+};
 
 class CAdapterEntry : public CNdisAllocatable<CAdapterEntry, '1ORP'>
 {
@@ -110,7 +157,15 @@ public:
     }
     virtual void Complete(NDIS_STATUS status)
     {
-        TraceNoPrefix(0, "[%s] %s\n", __FUNCTION__, ParaNdis_OidName(m_Request.DATA.SET_INFORMATION.Oid));
+        LPCSTR reqType = m_Request.RequestType == NdisRequestSetInformation ? "Set" : "Query";
+        if (status) {
+            TraceNoPrefix(0, "[%s] (%s)%s = %X\n", __FUNCTION__, reqType, ParaNdis_OidName(m_Request.DATA.SET_INFORMATION.Oid), status);
+        }
+        else {
+            TraceNoPrefix(0, "[%s] (%s)%s OK, %d bytes\n", __FUNCTION__, reqType,
+                ParaNdis_OidName(m_Request.DATA.SET_INFORMATION.Oid),
+                m_Request.DATA.QUERY_INFORMATION.BytesWritten);
+        }
         m_Status = status;
         m_Event.Notify();
     }
@@ -169,11 +224,11 @@ public:
     void Complete(NDIS_STATUS status) override
     {
         __super::Complete(status);
-        ParaNdis_DereferenceBinding(m_Adapter);
         Destroy(this, m_Handle);
     }
     ~COidWrapperAsync()
     {
+        ParaNdis_DereferenceBinding(m_Adapter);
         if (m_Data)
         {
             NdisFreeMemoryWithTagPriority(m_Handle, m_Data, DataTag);
@@ -186,6 +241,36 @@ private:
     NDIS_HANDLE m_Handle;
     PARANDIS_ADAPTER *m_Adapter;
 };
+
+static void PrintOffload(LPCSTR caller, NDIS_OFFLOAD& current)
+{
+    TraceNoPrefix(0, "[%s] Offload data v%d:\n", caller, current.Header.Revision);
+    NDIS_TCP_LARGE_SEND_OFFLOAD_V2& lso = current.LsoV2;
+    TraceNoPrefix(0, "LSOv2: v4 e:%X seg:%d, v6 e:%X seg:%d iph:%d opt:%d\n",
+        lso.IPv4.Encapsulation, lso.IPv4.MaxOffLoadSize,
+        lso.IPv6.Encapsulation, lso.IPv6.MaxOffLoadSize, lso.IPv6.IpExtensionHeadersSupported, lso.IPv6.TcpOptionsSupported);
+    NDIS_TCP_IP_CHECKSUM_OFFLOAD& cso = current.Checksum;
+    TraceNoPrefix(0, "Checksum4 RX: ip %d%c, tcp %d%c, udp %d\n",
+        cso.IPv4Receive.IpChecksum, cso.IPv4Receive.IpOptionsSupported ? '+' : ' ',
+        cso.IPv4Receive.TcpChecksum, cso.IPv4Receive.TcpOptionsSupported ? '+' : ' ',
+        cso.IPv4Receive.UdpChecksum);
+    TraceNoPrefix(0, "Checksum4 TX: ip %d%c, tcp %d%c, udp %d\n",
+        cso.IPv4Transmit.IpChecksum, cso.IPv4Transmit.IpOptionsSupported ? '+' : ' ',
+        cso.IPv4Transmit.TcpChecksum, cso.IPv4Transmit.TcpOptionsSupported ? '+' : ' ',
+        cso.IPv4Transmit.UdpChecksum);
+    TraceNoPrefix(0, "Checksum6 RX: ipx %d, tcp %d%c, udp %d\n",
+        cso.IPv6Receive.IpExtensionHeadersSupported,
+        cso.IPv6Receive.TcpChecksum, cso.IPv6Receive.TcpOptionsSupported ? '+' : ' ',
+        cso.IPv6Receive.UdpChecksum);
+    TraceNoPrefix(0, "Checksum6 TX: ipx %d, tcp %d%c, udp %d\n",
+        cso.IPv6Transmit.IpExtensionHeadersSupported,
+        cso.IPv6Transmit.TcpChecksum, cso.IPv6Transmit.TcpOptionsSupported ? '+' : ' ',
+        cso.IPv6Transmit.UdpChecksum);
+    if (current.Header.Revision > NDIS_OFFLOAD_REVISION_2) {
+        NDIS_TCP_RECV_SEG_COALESCE_OFFLOAD& rsc = current.Rsc;
+        TraceNoPrefix(0, "RSCv4 %d, RSCv6 %d\n", rsc.IPv4.Enabled, rsc.IPv6.Enabled);
+    }
+}
 
 class CParaNdisProtocol;
 
@@ -245,9 +330,14 @@ public:
             SetOid(OID_802_3_MULTICAST_LIST, m_BoundAdapter->MulticastData.MulticastList,
                 ETH_ALEN * m_BoundAdapter->MulticastData.nofMulticastEntries);
         }
-        // TODO: some other OIDs?
-
         m_BoundAdapter->m_StateMachine.NotifyBindSriov(this);
+
+        ParaNdis_PropagateOid(m_BoundAdapter, OID_GEN_RECEIVE_SCALE_PARAMETERS, NULL, 0);
+        ParaNdis_PropagateOid(m_BoundAdapter, OID_TCP_OFFLOAD_PARAMETERS, NULL, 0);
+        ParaNdis_PropagateOid(m_BoundAdapter, OID_OFFLOAD_ENCAPSULATION, NULL, 0);
+
+        QueryCurrentRSS();
+
         m_TxStateMachine.Start();
         m_RxStateMachine.Start();
         m_Started = true;
@@ -258,6 +348,7 @@ public:
     void OnAdapterFound(PARANDIS_ADAPTER *Adapter)
     {
         TraceNoPrefix(0, "[%s] %p\n", __FUNCTION__, Adapter);
+        TracePnpId(m_Pdo, Adapter);
         if (!CheckCompatibility(Adapter))
         {
             return;
@@ -328,6 +419,31 @@ public:
                     }
                 }
                 break;
+            case NDIS_STATUS_TASK_OFFLOAD_CURRENT_CONFIG:
+                {
+                    NDIS_OFFLOAD *o = (NDIS_OFFLOAD *)StatusIndication->StatusBuffer;
+                    PrintOffload(__FUNCTION__, *o);
+                    if (o->Header.Revision > NDIS_OFFLOAD_REVISION_3)
+                    {
+                        UCHAR knownMinor = m_Capabilies.NdisMinor;
+                        GUESS_VERSION(m_Capabilies.NdisMinor, 30);
+                        if (m_Capabilies.NdisMinor != knownMinor)
+                        {
+                            TraceNoPrefix(0, "[%s] Best guess for NDIS revision: 6.%d\n", __FUNCTION__, m_Capabilies.NdisMinor);
+                        }
+                    }
+                }
+                break;
+            case NDIS_STATUS_LINK_STATE:
+                {
+                    const char *states[] = { "Unknown", "Connected", "Disconnected" };
+                    NDIS_LINK_STATE *ls = (NDIS_LINK_STATE *)StatusIndication->StatusBuffer;
+                    ULONG state = ls->MediaConnectState;
+                    TraceNoPrefix(0, "[%s] link state %s(%d)\n", __FUNCTION__,
+                        state <= MediaConnectStateDisconnected ? states[state] : "Invalid",
+                        state);
+                }
+                break;
             default:
                 TraceNoPrefix(0, "[%s] code %X\n", __FUNCTION__, StatusIndication->StatusCode);
                 break;
@@ -343,8 +459,29 @@ public:
     void ReturnNbls(PNET_BUFFER_LIST pNBL, ULONG numNBLs, ULONG flags);
     void SetOidAsync(ULONG oid, PVOID data, ULONG size);
     void SetOid(ULONG oid, PVOID data, ULONG size);
+    void SetRSS();
+    void SetOffloadEncapsulation();
+    void SetOffloadParameters();
 private:
+    void QueryCurrentOffload();
+    void QueryCurrentRSS();
+    bool QueryOid(ULONG oid, PVOID data, ULONG size);
     void OnOpStateChange(bool State);
+    void CompleteInternalNbl(PNET_BUFFER_LIST Nbl)
+    {
+        m_InternalNbls.ForEachDetachedIf(
+            [Nbl](CInternalNblEntry *e)
+            {
+                return e->Match(Nbl);
+            },
+            [&](CInternalNblEntry *e)
+            {
+                e->Destroy(e, m_BindingHandle);
+                CGuestAnnouncePackets::NblCompletionCallback(Nbl);
+                return false;
+            }
+        );
+    }
     void OnLastReferenceGone() override;
     CParaNdisProtocol& m_Protocol;
     NDIS_HANDLE m_BindContext;
@@ -356,6 +493,7 @@ private:
     bool       m_Operational = false;
     // set and clear under protocol mutex
     bool       m_Started = false;
+    PDEVICE_OBJECT m_Pdo = NULL;
     NDIS_STATUS m_Status;
     struct
     {
@@ -403,6 +541,7 @@ private:
         } checksumRx;
     } m_Capabilies = {};
     CNdisSpinLock m_OpStateLock;
+    CNdisList<CInternalNblEntry, CLockedAccess, CNonCountingObject> m_InternalNbls;
     class COperationWorkItem : public CNdisAllocatable<COperationWorkItem, 'IWRP'>
     {
     public:
@@ -734,6 +873,8 @@ NDIS_STATUS CProtocolBinding::Bind(PNDIS_BIND_PARAMETERS BindParameters)
 
     AddRef();
 
+    m_Pdo = BindParameters->PhysicalDeviceObject;
+
     openParams.Header.Type = NDIS_OBJECT_TYPE_OPEN_PARAMETERS;
     openParams.Header.Revision = NDIS_OPEN_PARAMETERS_REVISION_1;
     openParams.Header.Size = NDIS_SIZEOF_OPEN_PARAMETERS_REVISION_1;
@@ -763,6 +904,8 @@ NDIS_STATUS CProtocolBinding::Bind(PNDIS_BIND_PARAMETERS BindParameters)
     }
 
     QueryCapabilities(BindParameters);
+    QueryCurrentOffload();
+    QueryCurrentRSS();
 
     if (NT_SUCCESS(status))
     {
@@ -863,6 +1006,60 @@ void ParaNdis_ProtocolReturnNbls(PARANDIS_ADAPTER *pContext, PNET_BUFFER_LIST pN
     }
 }
 
+void CProtocolBinding::QueryCurrentOffload()
+{
+    NDIS_OFFLOAD current;
+    current.Header.Type = NDIS_OBJECT_TYPE_OFFLOAD;
+    current.Header.Revision = NDIS_OFFLOAD_REVISION_3;
+    current.Header.Size = NDIS_SIZEOF_NDIS_OFFLOAD_REVISION_3;
+    if (!QueryOid(OID_TCP_OFFLOAD_CURRENT_CONFIG, &current, sizeof(current)))
+    {
+        return;
+    }
+    PrintOffload(__FUNCTION__, current);
+}
+
+void CProtocolBinding::QueryCurrentRSS()
+{
+    struct RSSQuery : public CNdisAllocatable<RSSQuery, 'QORP'>
+    {
+        RSSQuery()
+        {
+            RtlZeroMemory(&rsp, sizeof(rsp));
+            rsp.Header.Type = NDIS_OBJECT_TYPE_RSS_PARAMETERS;
+            rsp.Header.Revision = NDIS_RECEIVE_SCALE_PARAMETERS_REVISION_2;
+            rsp.Header.Size = NDIS_SIZEOF_RECEIVE_SCALE_PARAMETERS_REVISION_2;
+        }
+        NDIS_RECEIVE_SCALE_PARAMETERS rsp;
+        UCHAR key[NDIS_RSS_HASH_SECRET_KEY_MAX_SIZE_REVISION_1];
+        UCHAR indirection[NDIS_RSS_INDIRECTION_TABLE_MAX_SIZE_REVISION_2];
+    };
+    auto current = new (m_Protocol.DriverHandle()) RSSQuery;
+    if (!current) {
+        return;
+    }
+    if (QueryOid(OID_GEN_RECEIVE_SCALE_PARAMETERS, current, sizeof(*current)))
+    {
+        TraceNoPrefix(0, "[%s] RSS hash info %X\n", __FUNCTION__, current->rsp.HashInformation);
+    }
+    current->Destroy(current, m_Protocol.DriverHandle());
+}
+
+bool CProtocolBinding::QueryOid(ULONG oid, PVOID data, ULONG size)
+{
+    COidWrapper *p = new (m_Protocol.DriverHandle()) COidWrapper(NdisRequestQueryInformation, oid);
+    if (!p)
+    {
+        return false;
+    }
+    p->m_Request.DATA.SET_INFORMATION.InformationBuffer = data;
+    p->m_Request.DATA.SET_INFORMATION.InformationBufferLength = size;
+    p->Run(m_BindingHandle);
+    NTSTATUS status = p->Status();
+    p->Destroy(p, m_Protocol.DriverHandle());
+    return NT_SUCCESS(status);
+}
+
 void CProtocolBinding::SetOid(ULONG oid, PVOID data, ULONG size)
 {
     COidWrapper *p = new (m_Protocol.DriverHandle()) COidWrapper(NdisRequestSetInformation, oid);
@@ -924,11 +1121,29 @@ bool CProtocolBinding::Send(PNET_BUFFER_LIST Nbl, ULONG Count)
         return false;
     }
     PNET_BUFFER_LIST current = Nbl;
+
+    if (!CallCompletionForNBL(m_BoundAdapter, Nbl))
+    {
+        CInternalNblEntry *e = new (m_BindingHandle)CInternalNblEntry(Nbl);
+        if (!e)
+        {
+            m_TxStateMachine.UnregisterOutstandingItems(Count);
+            return false;
+        }
+        m_InternalNbls.PushBack(e);
+        TraceNoPrefix(0, "[%s] internal NBL %p, reserved %p\n",
+            __FUNCTION__, Nbl, Nbl->MiniportReserved[0]);
+    }
+
     while (current)
     {
         if (!KeepSourceHandleInContext(current))
         {
             RetrieveSourceHandle(Nbl, current);
+            if (!CallCompletionForNBL(m_BoundAdapter, Nbl))
+            {
+                CompleteInternalNbl(Nbl);
+            }
             m_TxStateMachine.UnregisterOutstandingItems(Count);
             // TODO: can we transmit the packets via NETKVM???
             return false;
@@ -941,24 +1156,42 @@ bool CProtocolBinding::Send(PNET_BUFFER_LIST Nbl, ULONG Count)
     return true;
 }
 
-static ULONG CountNblsAndErrors(PNET_BUFFER_LIST NBL, ULONG& errors)
-{
-    ULONG result;
-    for (result = 0, errors = 0; NBL != nullptr; NBL = NET_BUFFER_LIST_NEXT_NBL(NBL), result++)
-    {
-        if (NET_BUFFER_LIST_STATUS(NBL) != NDIS_STATUS_SUCCESS)
-            errors++;
-    }
-    return result;
-}
-
 void CProtocolBinding::OnSendCompletion(PNET_BUFFER_LIST Nbls, ULONG Flags)
 {
-    ULONG errors;
-    ULONG count = CountNblsAndErrors(Nbls, errors);
-    TraceNoPrefix(errors != 0 ? 0 : 1, "[%s] %d nbls(%d errors)\n", __FUNCTION__, count, errors);
+    PNET_BUFFER_LIST *pCurrent = &Nbls;
+    PNET_BUFFER_LIST current = Nbls;
+    ULONG errors = 0, count = 0;
+
     RetrieveSourceHandle(Nbls);
-    NdisMSendNetBufferListsComplete(m_BoundAdapter->MiniportHandle, Nbls, Flags);
+
+    while (current)
+    {
+        count++;
+        if (NET_BUFFER_LIST_STATUS(current) != NDIS_STATUS_SUCCESS)
+            errors++;
+        if (!CallCompletionForNBL(m_BoundAdapter, current))
+        {
+            // remove the NBL from the chain
+            PNET_BUFFER_LIST toFree = current;
+            TraceNoPrefix(0, "[%s] internal NBL %p, reserved %p\n", __FUNCTION__, toFree, toFree->MiniportReserved[0]);
+            *pCurrent = NET_BUFFER_LIST_NEXT_NBL(current);
+            NET_BUFFER_LIST_NEXT_NBL(toFree) = NULL;
+            // return the NBL to the owner
+            CompleteInternalNbl(toFree);
+        }
+        else
+        {
+            pCurrent = &NET_BUFFER_LIST_NEXT_NBL(*pCurrent);
+        }
+        current = *pCurrent;
+    }
+
+    TraceNoPrefix(errors != 0 ? 0 : 1, "[%s] %d nbls(%d errors)\n", __FUNCTION__, count, errors);
+
+    if (Nbls)
+    {
+        NdisMSendNetBufferListsComplete(m_BoundAdapter->MiniportHandle, Nbls, Flags);
+    }
     m_TxStateMachine.UnregisterOutstandingItems(count);
 }
 
@@ -1002,7 +1235,21 @@ VOID ParaNdis_PropagateOid(PARANDIS_ADAPTER *pContext, NDIS_OID oid, PVOID buffe
     {
         return;
     }
-    pb->SetOidAsync(oid, buffer, length);
+    switch (oid)
+    {
+        case OID_GEN_RECEIVE_SCALE_PARAMETERS:
+            pb->SetRSS();
+            break;
+        case OID_OFFLOAD_ENCAPSULATION:
+            pb->SetOffloadEncapsulation();
+            break;
+        case OID_TCP_OFFLOAD_PARAMETERS:
+            pb->SetOffloadParameters();
+            break;
+        default:
+            pb->SetOidAsync(oid, buffer, length);
+            break;
+    }
 }
 
 void CProtocolBinding::QueryCapabilities(PNDIS_BIND_PARAMETERS BindParameters)
@@ -1027,7 +1274,7 @@ void CProtocolBinding::QueryCapabilities(PNDIS_BIND_PARAMETERS BindParameters)
             hds.ipv6ext = flags & NDIS_HD_SPLIT_CAPS_SUPPORTS_IPV6_EXTENSION_HEADERS;
             hds.maxHeader = BindParameters->HDSplitCurrentConfig->MaxHeaderSize;
             hds.backfill = BindParameters->HDSplitCurrentConfig->BackfillSize;
-            m_Capabilies.NdisMinor = 10;
+            GUESS_VERSION(m_Capabilies.NdisMinor, 10);
             TraceNoPrefix(0, "[%s] HDS: ipv4opt:%d, ipv6ext:%d, tcpopt:%d, max header:%d, backfill %d\n",
                 __FUNCTION__, hds.ipv4opt, hds.ipv6ext, hds.tcpopt, hds.maxHeader, hds.backfill);
         }
@@ -1041,9 +1288,12 @@ void CProtocolBinding::QueryCapabilities(PNDIS_BIND_PARAMETERS BindParameters)
         m_Capabilies.rss.v6ex = flags & NDIS_RSS_CAPS_HASH_TYPE_TCP_IPV6_EX;
         m_Capabilies.rss.queues = BindParameters->RcvScaleCapabilities->NumberOfReceiveQueues;
         m_Capabilies.rss.vectors = BindParameters->RcvScaleCapabilities->NumberOfInterruptMessages;
+        if (flags & NDIS_RSS_CAPS_USING_MSI_X) {
+            GUESS_VERSION(m_Capabilies.NdisMinor, 20);
+        }
         if (BindParameters->RcvScaleCapabilities->Header.Revision > NDIS_SIZEOF_RECEIVE_SCALE_CAPABILITIES_REVISION_1)
         {
-            m_Capabilies.NdisMinor = 30;
+            GUESS_VERSION(m_Capabilies.NdisMinor, 30);
             m_Capabilies.rss.tableSize = BindParameters->RcvScaleCapabilities->NumberOfIndirectionTableEntries;
         }
         TraceNoPrefix(0, "[%s] RSS: v4:%d,v6:%d,v6ex:%d, queues:%d, vectors:%d, max table:%d\n", __FUNCTION__,
@@ -1062,7 +1312,7 @@ void CProtocolBinding::QueryCapabilities(PNDIS_BIND_PARAMETERS BindParameters)
         m_Capabilies.rsc.v6 = doc->Rsc.IPv6.Enabled;
         if (m_Capabilies.rsc.v4 || m_Capabilies.rsc.v6)
         {
-            m_Capabilies.NdisMinor = 30;
+            GUESS_VERSION(m_Capabilies.NdisMinor, 30);
         }
         m_Capabilies.lsov2.v4.maxPayload = doc->LsoV2.IPv4.MaxOffLoadSize;
         m_Capabilies.lsov2.v4.minSegments = doc->LsoV2.IPv4.MinSegmentCount;
@@ -1112,6 +1362,188 @@ void CProtocolBinding::OnOpStateChange(bool State)
     if (State && !m_Started && m_BoundAdapter)
     {
         OnAdapterAttached();
+    }
+}
+
+// Do not call this procedure directly, only via ParaNdis_PropagateOid
+// as it is asynchronous and will call ParaNdis_DereferenceBinding
+void CProtocolBinding::SetRSS()
+{
+    bool bSkip = !m_Capabilies.rss.queues;
+    COidWrapperAsync *p = NULL;
+    struct RSSSet : public CNdisAllocatable<RSSSet, 'SORP'>
+    {
+        NDIS_RECEIVE_SCALE_PARAMETERS rsp;
+        UCHAR key[NDIS_RSS_HASH_SECRET_KEY_MAX_SIZE_REVISION_1];
+        UCHAR indirection[NDIS_RSS_INDIRECTION_TABLE_MAX_SIZE_REVISION_2];
+    };
+    auto current = new (m_Protocol.DriverHandle()) RSSSet;
+    bSkip = !current || bSkip;
+    if (!bSkip) {
+        RtlZeroMemory(current, sizeof(*current));
+        current->rsp.Header.Type = NDIS_OBJECT_TYPE_RSS_PARAMETERS;
+        current->rsp.Header.Revision = NDIS_RECEIVE_SCALE_PARAMETERS_REVISION_2;
+        current->rsp.Header.Size = NDIS_SIZEOF_RECEIVE_SCALE_PARAMETERS_REVISION_2;
+        switch (m_BoundAdapter->RSSParameters.RSSMode)
+        {
+            case PARANDIS_RSS_FULL:
+            case PARANDIS_RSS_HASHING:
+                current->rsp.HashInformation = m_BoundAdapter->RSSParameters.ActiveHashingSettings.HashInformation;
+                current->rsp.HashSecretKeyOffset = FIELD_OFFSET(RSSSet, key);
+                current->rsp.HashSecretKeySize = m_BoundAdapter->RSSParameters.ActiveHashingSettings.HashSecretKeySize;
+                RtlMoveMemory(current->key,
+                    m_BoundAdapter->RSSParameters.ActiveHashingSettings.HashSecretKey,
+                    current->rsp.HashSecretKeySize);
+                current->rsp.IndirectionTableOffset = FIELD_OFFSET(RSSSet, indirection);
+                current->rsp.IndirectionTableSize = m_BoundAdapter->RSSParameters.ActiveRSSScalingSettings.IndirectionTableSize;
+                RtlMoveMemory(current->indirection,
+                    m_BoundAdapter->RSSParameters.ActiveRSSScalingSettings.IndirectionTable,
+                    current->rsp.IndirectionTableSize);
+                break;
+            default:
+                current->rsp.Flags = NDIS_RSS_PARAM_FLAG_DISABLE_RSS;
+                break;
+        }
+#if (NDIS_SUPPORT_NDIS680)
+        current->rsp.HashInformation &= ~(NDIS_HASH_UDP_IPV4 | NDIS_HASH_UDP_IPV6 | NDIS_HASH_UDP_IPV6_EX);
+#endif // (NDIS_SUPPORT_NDIS680)
+        if (!m_Capabilies.rss.v6ex) {
+            current->rsp.HashInformation &= ~(NDIS_HASH_IPV6_EX | NDIS_HASH_TCP_IPV6_EX);
+        }
+        if (!m_Capabilies.rss.v6) {
+            current->rsp.HashInformation &= ~(NDIS_HASH_IPV6 | NDIS_HASH_TCP_IPV6);
+        }
+        p = new (m_Protocol.DriverHandle()) COidWrapperAsync(m_BoundAdapter, NdisRequestSetInformation, OID_GEN_RECEIVE_SCALE_PARAMETERS, current, sizeof(*current));
+        if (!p){
+            bSkip = true;
+        }
+    }
+    if (!bSkip) {
+        TraceNoPrefix(0, "[%s] Using hash info %X\n", __FUNCTION__, current->rsp.HashInformation);
+        p->Run(m_BindingHandle);
+    } else {
+        ParaNdis_DereferenceBinding(m_BoundAdapter);
+    }
+    if (current) {
+        current->Destroy(current, m_Protocol.DriverHandle());
+    }
+}
+
+void CProtocolBinding::SetOffloadEncapsulation()
+{
+    bool bSkip = !m_Capabilies.lsov2.v4.maxPayload && !m_Capabilies.lsov2.v6.maxPayload;
+    COidWrapperAsync *p = NULL;
+    struct EncapSet : public CNdisAllocatable<EncapSet, 'EORP'>
+    {
+        NDIS_OFFLOAD_ENCAPSULATION e;
+    };
+    auto current = new (m_Protocol.DriverHandle()) EncapSet;
+    bSkip = !current || bSkip;
+    if (!bSkip) {
+        RtlZeroMemory(current, sizeof(*current));
+        current->e.Header.Type = NDIS_OBJECT_TYPE_OFFLOAD_ENCAPSULATION;
+        current->e.Header.Revision = NDIS_OFFLOAD_ENCAPSULATION_REVISION_1;
+        current->e.Header.Size = NDIS_SIZEOF_OFFLOAD_ENCAPSULATION_REVISION_1;
+        current->e.IPv4.EncapsulationType = NDIS_ENCAPSULATION_IEEE_802_3;
+        current->e.IPv6.EncapsulationType = NDIS_ENCAPSULATION_IEEE_802_3;
+        if (m_BoundAdapter->bOffloadv4Enabled && m_Capabilies.lsov2.v4.maxPayload) {
+            current->e.IPv4.Enabled = NDIS_OFFLOAD_SET_ON;
+            current->e.IPv4.HeaderSize = m_BoundAdapter->Offload.ipHeaderOffset;
+        } else {
+            current->e.IPv4.Enabled = NDIS_OFFLOAD_SET_OFF;
+            current->e.IPv4.HeaderSize = 0;
+        }
+        if (m_BoundAdapter->bOffloadv6Enabled && m_Capabilies.lsov2.v6.maxPayload) {
+            current->e.IPv6.Enabled = NDIS_OFFLOAD_SET_ON;
+            current->e.IPv6.HeaderSize = m_BoundAdapter->Offload.ipHeaderOffset;
+        }
+        else {
+            current->e.IPv6.Enabled = NDIS_OFFLOAD_SET_OFF;
+            current->e.IPv6.HeaderSize = 0;
+        }
+
+        p = new (m_Protocol.DriverHandle()) COidWrapperAsync(m_BoundAdapter, NdisRequestSetInformation, OID_OFFLOAD_ENCAPSULATION, current, sizeof(*current));
+        if (!p) {
+            bSkip = true;
+        }
+    }
+    if (!bSkip) {
+        TraceNoPrefix(0, "[%s] Using v4:%d, v6:%d\n", __FUNCTION__, current->e.IPv4.HeaderSize, current->e.IPv6.HeaderSize);
+        p->Run(m_BindingHandle);
+    }
+    else {
+        ParaNdis_DereferenceBinding(m_BoundAdapter);
+    }
+    if (current) {
+        current->Destroy(current, m_Protocol.DriverHandle());
+    }
+}
+
+static UCHAR ChecksumSetting(int Tx, int Rx)
+{
+    const UCHAR values[4] =
+    {
+        NDIS_OFFLOAD_PARAMETERS_TX_RX_DISABLED,
+        NDIS_OFFLOAD_PARAMETERS_TX_ENABLED_RX_DISABLED,
+        NDIS_OFFLOAD_PARAMETERS_RX_ENABLED_TX_DISABLED,
+        NDIS_OFFLOAD_PARAMETERS_TX_RX_ENABLED
+    };
+    Tx = Tx ? 1 : 0;
+    Rx = Rx ? 2 : 0;
+    return values[Tx + Rx];
+}
+
+void CProtocolBinding::SetOffloadParameters()
+{
+    bool bSkip = false;
+    COidWrapperAsync *p = NULL;
+    struct OffloadParam : public CNdisAllocatable<OffloadParam, 'EORP'>
+    {
+        NDIS_OFFLOAD_PARAMETERS o;
+    };
+    auto current = new (m_Protocol.DriverHandle()) OffloadParam;
+    bSkip = !current || bSkip;
+    if (!bSkip) {
+        tOffloadSettingsFlags f = m_BoundAdapter->Offload.flags;
+        RtlZeroMemory(current, sizeof(*current));
+        current->o.Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
+        current->o.Header.Revision = NDIS_OFFLOAD_PARAMETERS_REVISION_2;
+        current->o.Header.Size = NDIS_SIZEOF_OFFLOAD_PARAMETERS_REVISION_2;
+        if (m_Capabilies.NdisMinor >= 30) {
+            current->o.Header.Revision = NDIS_OFFLOAD_PARAMETERS_REVISION_3;
+            current->o.Header.Size = NDIS_SIZEOF_OFFLOAD_PARAMETERS_REVISION_3;
+        }
+        current->o.RscIPv4 = m_BoundAdapter->RSC.bIPv4Enabled ?
+            NDIS_OFFLOAD_PARAMETERS_RSC_ENABLED : NDIS_OFFLOAD_PARAMETERS_RSC_DISABLED;
+        current->o.RscIPv6 = m_BoundAdapter->RSC.bIPv6Enabled ?
+            NDIS_OFFLOAD_PARAMETERS_RSC_ENABLED : NDIS_OFFLOAD_PARAMETERS_RSC_DISABLED;
+        if (m_Capabilies.lsov2.v4.maxPayload) {
+            current->o.LsoV2IPv4 = f.fTxLso ? NDIS_OFFLOAD_PARAMETERS_LSOV2_ENABLED : NDIS_OFFLOAD_PARAMETERS_LSOV2_DISABLED;
+        }
+        if (m_Capabilies.lsov2.v6.maxPayload) {
+            current->o.LsoV2IPv6 = f.fTxLsov6 ? NDIS_OFFLOAD_PARAMETERS_LSOV2_ENABLED : NDIS_OFFLOAD_PARAMETERS_LSOV2_DISABLED;
+        }
+        current->o.IPv4Checksum = ChecksumSetting(f.fTxIPChecksum, f.fRxIPChecksum);
+        current->o.TCPIPv4Checksum = ChecksumSetting(f.fTxTCPChecksum, f.fRxTCPChecksum);
+        current->o.TCPIPv6Checksum = ChecksumSetting(f.fTxTCPv6Checksum, f.fRxTCPv6Checksum);
+        current->o.UDPIPv4Checksum = ChecksumSetting(f.fTxUDPChecksum, f.fRxUDPChecksum);
+        current->o.UDPIPv6Checksum = ChecksumSetting(f.fTxUDPv6Checksum, f.fRxUDPv6Checksum);
+
+        p = new (m_Protocol.DriverHandle()) COidWrapperAsync(m_BoundAdapter, NdisRequestSetInformation, OID_TCP_OFFLOAD_PARAMETERS, current, sizeof(*current));
+        if (!p) {
+            bSkip = true;
+        }
+    }
+    if (!bSkip) {
+        TraceNoPrefix(0, "[%s] Using Rsc v4:%d, v6:%d\n", __FUNCTION__, current->o.RscIPv4, current->o.RscIPv6);
+        TraceNoPrefix(0, "[%s] Using LsoV2 v4:%d, v6:%d\n", __FUNCTION__, current->o.LsoV2IPv4, current->o.LsoV2IPv6);
+        p->Run(m_BindingHandle);
+    }
+    else {
+        ParaNdis_DereferenceBinding(m_BoundAdapter);
+    }
+    if (current) {
+        current->Destroy(current, m_Protocol.DriverHandle());
     }
 }
 

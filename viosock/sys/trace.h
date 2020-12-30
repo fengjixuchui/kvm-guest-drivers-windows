@@ -69,6 +69,7 @@ extern int driverDebugLevel;
 #define DBG_QUEUEING            0x00000800
 #define DBG_HW_ACCESS           0x00001000
 #define DBG_SOCKET              0x00002000
+#define DBG_SELECT              0x00004000
 
 #define TraceEvents(level, flags, message, ...) \
 if (level > driverDebugLevel || !bDebugPrint || !(driverDebugFlags & flags)) {} \
@@ -102,6 +103,7 @@ else VirtioDebugPrintProc(message, __VA_ARGS__)
         WPP_DEFINE_BIT(DBG_QUEUEING)         /* bit 11 = 0x00000800 */ \
         WPP_DEFINE_BIT(DBG_HW_ACCESS)        /* bit 12 = 0x00001000 */ \
         WPP_DEFINE_BIT(DBG_SOCKET)           /* bit 13 = 0x00002000 */ \
+        WPP_DEFINE_BIT(DBG_SELECT)           /* bit 14 = 0x00004000 */ \
         )
 
 #define WPP_FLAG_LEVEL_LOGGER(flag, level) \
@@ -123,6 +125,8 @@ else VirtioDebugPrintProc(message, __VA_ARGS__)
  // begin_wpp config
  // FUNC Trace{FLAG=MYDRIVER_ALL_INFO}(LEVEL, MSG, ...);
  // FUNC TraceEvents(LEVEL, FLAGS, MSG, ...);
+ // CUSTOM_TYPE(State,ItemListLong(CLOSE, CONNECTING, CONNECTED, CLOSING, LISTEN));
+ // CUSTOM_TYPE(Op,ItemListShort(INVALID, REQUEST, RESPONSE, RST, SHUTDOWN, RW, CREDIT_UPDATE, CREDIT_REQUEST));
  // end_wpp
  //
 

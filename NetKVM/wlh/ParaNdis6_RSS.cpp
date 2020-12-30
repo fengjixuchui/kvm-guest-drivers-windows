@@ -43,8 +43,6 @@ static VOID ApplySettings(PPARANDIS_RSS_PARAMS RSSParameters,
 static VOID InitRSSParameters(PARANDIS_ADAPTER *pContext)
 {
     PARANDIS_RSS_PARAMS *RSSParameters = &pContext->RSSParameters;
-    NdisZeroMemory(RSSParameters, sizeof(*RSSParameters));
-    RSSParameters->pContext = pContext;
     RSSParameters->ReceiveQueuesNumber = pContext->RSSMaxQueuesNumber;
     RSSParameters->RSSScalingSettings.DefaultQueue = PARANDIS_RECEIVE_UNCLASSIFIED_PACKET;
     RSSParameters->ActiveRSSScalingSettings.DefaultQueue = PARANDIS_RECEIVE_UNCLASSIFIED_PACKET;
@@ -151,11 +149,6 @@ NDIS_RECEIVE_SCALE_CAPABILITIES* ParaNdis6_RSSCreateConfiguration(PARANDIS_ADAPT
     InitRSSParameters(pContext);
     InitRSSCapabilities(pContext);
     return &pContext->RSSCapabilities;
-}
-
-VOID ParaNdis6_RSSCleanupConfiguration(PARANDIS_RSS_PARAMS *RSSParameters)
-{
-    CleanupRSSParameters(RSSParameters);
 }
 
 static ULONG TranslateHashTypes(ULONG hashSettings)
@@ -1086,6 +1079,16 @@ void ParaNdis6_EnableDeviceRssSupport(PARANDIS_ADAPTER *pContext, BOOLEAN b)
         pContext->bRSSSupportedByDevice = pContext->bRSSSupportedByDevicePersistent;
         SetDeviceRSSSettings(pContext);
     }
+}
+
+PARANDIS_RSS_PARAMS::PARANDIS_RSS_PARAMS(PARANDIS_ADAPTER *pContext) : m_pContext(pContext)
+{
+    FailedInitialization = !rwLock.Create(pContext->MiniportHandle);
+}
+
+PARANDIS_RSS_PARAMS::~PARANDIS_RSS_PARAMS()
+{
+    CleanupRSSParameters(this);
 }
 
 #endif
