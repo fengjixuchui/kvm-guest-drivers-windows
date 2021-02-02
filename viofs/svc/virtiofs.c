@@ -65,6 +65,7 @@
 #define O_EXCL      0200
 #define S_IFMT      0170000
 #define S_IFDIR     040000
+#define S_IFLNK     0120000
 
 #define DBG(format, ...) \
     FspDebugLog("*** %s: " format "\n", __FUNCTION__, __VA_ARGS__)
@@ -263,6 +264,10 @@ static UINT32 PosixUnixModeToAttributes(uint32_t mode)
             Attributes = FILE_ATTRIBUTE_DIRECTORY;
             break;
 
+        case S_IFLNK:
+            Attributes = FILE_ATTRIBUTE_REPARSE_POINT;
+            break;
+
         default:
             Attributes = FILE_ATTRIBUTE_ARCHIVE;
             break;
@@ -324,9 +329,18 @@ static VOID UnixTimeToFileTime(uint64_t time, uint32_t nsec,
 static VOID SetFileInfo(struct fuse_attr *attr, FSP_FSCTL_FILE_INFO *FileInfo)
 {
     FileInfo->FileAttributes = PosixUnixModeToAttributes(attr->mode);
-    FileInfo->ReparseTag = 0;
-    FileInfo->AllocationSize = attr->blocks * 512;
-    FileInfo->FileSize = attr->size;
+    if (FileInfo->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+    {
+        FileInfo->ReparseTag = IO_REPARSE_TAG_SYMLINK;
+        FileInfo->FileSize = 0;
+        FileInfo->AllocationSize = 0;
+    }
+    else
+    {
+        FileInfo->ReparseTag = 0;
+        FileInfo->FileSize = attr->size;
+        FileInfo->AllocationSize = attr->blocks * 512;
+    }
     UnixTimeToFileTime(attr->ctime, attr->ctimensec, &FileInfo->CreationTime);
     UnixTimeToFileTime(attr->atime, attr->atimensec,
         &FileInfo->LastAccessTime);
@@ -545,6 +559,35 @@ static NTSTATUS SubmitLookupRequest(HANDLE Device, uint64_t parent,
     return Status;
 }
 
+static NTSTATUS SubmitReadLinkRequest(HANDLE Device, UINT64 NodeId,
+    PWSTR SubstituteName, PUSHORT SubstituteNameLength)
+{
+    FUSE_READLINK_IN readlink_in;
+    FUSE_READLINK_OUT readlink_out;
+    NTSTATUS Status;
+
+    FUSE_HEADER_INIT(&readlink_in.hdr, FUSE_READLINK, NodeId,
+        sizeof(readlink_out.name));
+
+    Status = VirtFsFuseRequest(Device, &readlink_in, readlink_in.hdr.len,
+        &readlink_out, sizeof(readlink_out));
+
+    if (NT_SUCCESS(Status))
+    {
+        int namelen = readlink_out.hdr.len - sizeof(readlink_out.hdr);
+
+        *SubstituteNameLength = (USHORT)MultiByteToWideChar(CP_UTF8, 0,
+            readlink_out.name, namelen, SubstituteName, MAX_PATH);
+
+        if (*SubstituteNameLength == 0)
+        {
+            Status = FspNtStatusFromWin32(GetLastError());
+        }
+    }
+
+    return Status;
+}
+
 static NTSTATUS PathWalkthough(HANDLE Device, CHAR *FullPath,
     CHAR **FileName, UINT64 *Parent)
 {
@@ -581,10 +624,15 @@ static NTSTATUS VirtFsLookupFileName(HANDLE Device, PWSTR FileName,
 
     if (lstrcmp(FileName, TEXT("\\")) == 0)
     {
-        FileName = TEXT("\\.");
+        FileName = TEXT(".");
+    }
+    else if (FileName[0] == TEXT('\\'))
+    {
+        // Skip slash if exist.
+        FileName += 1;
     }
 
-    Status = FspPosixMapWindowsToPosixPath(FileName + 1, &fullpath);
+    Status = FspPosixMapWindowsToPosixPath(FileName, &fullpath);
     if (!NT_SUCCESS(Status))
     {
         FspPosixDeletePath(fullpath);
@@ -711,6 +759,49 @@ static VOID GetVolumeName(HANDLE Device, PWSTR VolumeName,
     {
         lstrcpy(VolumeName, L"Default");
     }
+}
+
+static NTSTATUS GetReparsePointByName(FSP_FILE_SYSTEM *FileSystem,
+    PVOID Context, PWSTR FileName, BOOLEAN IsDirectory, PVOID Buffer,
+    PSIZE_T PSize)
+{
+    VIRTFS *VirtFs = FileSystem->UserContext;
+    PREPARSE_DATA_BUFFER ReparseData = Buffer;
+    FUSE_LOOKUP_OUT lookup_out;
+    WCHAR SubstituteName[MAX_PATH];
+    USHORT SubstituteNameLength = 0;
+    NTSTATUS Status;
+
+    UNREFERENCED_PARAMETER(Context);
+    UNREFERENCED_PARAMETER(IsDirectory);
+    UNREFERENCED_PARAMETER(PSize);
+
+    Status = VirtFsLookupFileName(VirtFs->Device, FileName, &lookup_out);
+    if (!NT_SUCCESS(Status))
+    {
+        return Status;
+    }
+
+    if ((lookup_out.entry.attr.mode & S_IFLNK) != S_IFLNK)
+    {
+        return STATUS_NOT_A_REPARSE_POINT;
+    }
+
+    Status = SubmitReadLinkRequest(VirtFs->Device, lookup_out.entry.nodeid,
+        SubstituteName, &SubstituteNameLength);
+
+    if (NT_SUCCESS(Status))
+    {
+        ReparseData->ReparseTag = IO_REPARSE_TAG_SYMLINK;
+        ReparseData->SymbolicLinkReparseBuffer.Flags = SYMLINK_FLAG_RELATIVE;
+        ReparseData->SymbolicLinkReparseBuffer.SubstituteNameOffset = 0;
+        ReparseData->SymbolicLinkReparseBuffer.SubstituteNameLength =
+            SubstituteNameLength * sizeof(WCHAR);
+        CopyMemory(ReparseData->SymbolicLinkReparseBuffer.PathBuffer,
+            SubstituteName, SubstituteNameLength * sizeof(WCHAR));
+    }
+
+    return Status;
 }
 
 static NTSTATUS GetVolumeInfo(FSP_FILE_SYSTEM *FileSystem,
@@ -840,16 +931,16 @@ static NTSTATUS Create(FSP_FILE_SYSTEM *FileSystem, PWSTR FileName,
         return Status;
     }
 
+    FspPosixDeletePath(fullpath);
+
     FileContext = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
         sizeof(*FileContext));
 
     if (FileContext == NULL)
     {
-        FspPosixDeletePath(fullpath);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    FileContext->IsDirectory = !!(CreateOptions & FILE_DIRECTORY_FILE);
     FileContext->FileHandle = INVALID_FILE_HANDLE;
 
     if (!!(FileAttributes & FILE_ATTRIBUTE_READONLY) == TRUE)
@@ -857,18 +948,25 @@ static NTSTATUS Create(FSP_FILE_SYSTEM *FileSystem, PWSTR FileName,
         Mode &= ~0222;
     }
 
-    if (FileContext->IsDirectory == TRUE)
+    if (CreateOptions & FILE_DIRECTORY_FILE)
     {
+        FileContext->IsDirectory = TRUE;
+
         Status = VirtFsCreateDir(VirtFs, FileContext, filename, parent, Mode,
             FileInfo);
+    }
+    else if (CreateOptions & FILE_OPEN_REPARSE_POINT)
+    {
+        // The actual symbolic link will be created later in the
+        // SetReparsePoint callback.
+        FileInfo->FileAttributes |= FILE_ATTRIBUTE_REPARSE_POINT;
+        FileInfo->ReparseTag = IO_REPARSE_TAG_SYMLINK;
     }
     else
     {
         Status = VirtFsCreateFile(VirtFs, FileContext, GrantedAccess,
             filename, parent, Mode, AllocationSize, FileInfo);
     }
-
-    FspPosixDeletePath(fullpath);
 
     if (!NT_SUCCESS(Status))
     {
@@ -910,35 +1008,35 @@ static NTSTATUS Open(FSP_FILE_SYSTEM *FileSystem, PWSTR FileName,
         return Status;
     }
 
-    FileContext->IsDirectory = !!(lookup_out.entry.attr.mode & S_IFDIR);
-
-    FUSE_HEADER_INIT(&open_in.hdr,
-        (FileContext->IsDirectory == TRUE) ? FUSE_OPENDIR : FUSE_OPEN,
-        lookup_out.entry.nodeid, sizeof(open_in.open));
-
-    open_in.open.flags = AccessToUnixFlags(GrantedAccess);
-
-    if (FileContext->IsDirectory == TRUE)
+    if ((lookup_out.entry.attr.mode & S_IFLNK) != S_IFLNK)
     {
-        open_in.open.flags |= O_DIRECTORY;
+        FileContext->IsDirectory = !!(lookup_out.entry.attr.mode & S_IFDIR);
+
+        FUSE_HEADER_INIT(&open_in.hdr,
+            (FileContext->IsDirectory == TRUE) ? FUSE_OPENDIR : FUSE_OPEN,
+            lookup_out.entry.nodeid, sizeof(open_in.open));
+
+        open_in.open.flags = AccessToUnixFlags(GrantedAccess);
+
+        if (FileContext->IsDirectory == TRUE)
+        {
+            open_in.open.flags |= O_DIRECTORY;
+        }
+
+        Status = VirtFsFuseRequest(VirtFs->Device, &open_in, sizeof(open_in),
+            &open_out, sizeof(open_out));
+
+        if (!NT_SUCCESS(Status))
+        {
+            SafeHeapFree(FileContext);
+            return Status;
+        }
+
+        FileContext->FileHandle = open_out.open.fh;
     }
-
-    Status = VirtFsFuseRequest(VirtFs->Device, &open_in, sizeof(open_in),
-        &open_out, sizeof(open_out));
-
-    if (!NT_SUCCESS(Status))
-    {
-        SafeHeapFree(FileContext);
-        return Status;
-    }
-
-    FileContext->NodeId = lookup_out.entry.nodeid;
-    FileContext->FileHandle = open_out.open.fh;
-    
-    DBG("fh: %I64u nodeid: %I64u", FileContext->FileHandle, FileContext->NodeId);
 
     SetFileInfo(&lookup_out.entry.attr, FileInfo);
-    
+    FileContext->NodeId = lookup_out.entry.nodeid;
     *PFileContext = FileContext;
 
     return Status;
@@ -1513,6 +1611,8 @@ static NTSTATUS Rename(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
         Status = STATUS_ACCESS_DENIED;
     }
 
+    SafeHeapFree(rename2_in);
+
     return Status;
 }
 
@@ -1748,6 +1848,125 @@ static NTSTATUS ReadDirectory(FSP_FILE_SYSTEM *FileSystem, PVOID FileContext0,
     return Status;
 }
 
+static NTSTATUS ResolveReparsePoints(FSP_FILE_SYSTEM *FileSystem,
+    PWSTR FileName, UINT32 ReparsePointIndex,
+    BOOLEAN ResolveLastPathComponent, PIO_STATUS_BLOCK PIoStatus,
+    PVOID Buffer, PSIZE_T PSize)
+{
+    return FspFileSystemResolveReparsePoints(FileSystem,
+        GetReparsePointByName, NULL, FileName, ReparsePointIndex,
+        ResolveLastPathComponent, PIoStatus, Buffer, PSize);
+}
+
+static NTSTATUS SetReparsePoint(FSP_FILE_SYSTEM *FileSystem,
+    PVOID FileContext, PWSTR FileName, PVOID Buffer, SIZE_T Size)
+{
+    VIRTFS *VirtFs = FileSystem->UserContext;
+    PREPARSE_DATA_BUFFER ReparseData = Buffer;
+    FUSE_SYMLINK_IN *symlink_in;
+    FUSE_SYMLINK_OUT symlink_out;
+    WCHAR TargetName[MAX_PATH];
+    USHORT TargetLength;
+    NTSTATUS Status;
+    char *filename, *linkname, *targetname;
+    int linkname_len, targetname_len;
+    uint64_t parent;
+
+    UNREFERENCED_PARAMETER(FileContext);
+    UNREFERENCED_PARAMETER(Size);
+
+    DBG("\"%S\"", FileName);
+
+    CopyMemory(TargetName,
+        ReparseData->SymbolicLinkReparseBuffer.PathBuffer +
+            (ReparseData->SymbolicLinkReparseBuffer.SubstituteNameOffset /
+                sizeof(WCHAR)),
+        ReparseData->SymbolicLinkReparseBuffer.SubstituteNameLength);
+
+    TargetLength =
+        ReparseData->SymbolicLinkReparseBuffer.SubstituteNameLength /
+        sizeof(WCHAR);
+
+    TargetName[TargetLength] = TEXT('\0');
+
+    Status = FspPosixMapWindowsToPosixPath(TargetName, &targetname);
+    if (!NT_SUCCESS(Status))
+    {
+        FspPosixDeletePath(targetname);
+        return Status;
+    }
+
+    Status = PathWalkthough(VirtFs->Device, targetname, &filename, &parent);
+    if (!NT_SUCCESS(Status))
+    {
+        FspPosixDeletePath(targetname);
+        return Status;
+    }
+
+    Status = FspPosixMapWindowsToPosixPath(FileName + 1, &linkname);
+    if (!NT_SUCCESS(Status))
+    {
+        FspPosixDeletePath(targetname);
+        FspPosixDeletePath(linkname);
+        return Status;
+    }
+
+    linkname_len = lstrlenA(linkname) + 1;
+    targetname_len = lstrlenA(targetname) + 1;
+
+    symlink_in = HeapAlloc(GetProcessHeap(), 0, sizeof(*symlink_in) +
+        linkname_len + targetname_len);
+
+    if (symlink_in == NULL)
+    {
+        FspPosixDeletePath(targetname);
+        FspPosixDeletePath(linkname);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    FUSE_HEADER_INIT(&symlink_in->hdr, FUSE_SYMLINK, parent,
+        linkname_len + targetname_len);
+
+    CopyMemory(symlink_in->names, linkname, linkname_len);
+    CopyMemory(symlink_in->names + linkname_len, targetname, targetname_len);
+
+    FspPosixDeletePath(targetname);
+    FspPosixDeletePath(linkname);
+
+    Status = VirtFsFuseRequest(VirtFs->Device, symlink_in,
+        symlink_in->hdr.len, &symlink_out, sizeof(symlink_out));
+
+    SafeHeapFree(symlink_in);
+
+    return Status;
+}
+
+static NTSTATUS GetDirInfoByName(FSP_FILE_SYSTEM *FileSystem,
+    PVOID FileContext, PWSTR FileName, FSP_FSCTL_DIR_INFO *DirInfo)
+{
+    VIRTFS *VirtFs = FileSystem->UserContext;
+    FUSE_LOOKUP_OUT lookup_out;
+    NTSTATUS Status;
+
+    UNREFERENCED_PARAMETER(FileContext);
+
+    DBG("\"%S\"", FileName);
+
+    Status = VirtFsLookupFileName(VirtFs->Device, FileName, &lookup_out);
+    if (NT_SUCCESS(Status))
+    {
+        DirInfo->Size = (UINT16)(sizeof(FSP_FSCTL_DIR_INFO) +
+            wcslen(FileName) * sizeof(WCHAR));
+
+        SetFileInfo(&lookup_out.entry.attr, &DirInfo->FileInfo);
+
+        CopyMemory(DirInfo->FileNameBuf, FileName,
+            DirInfo->Size - sizeof(FSP_FSCTL_DIR_INFO));
+    }
+
+    return Status;
+}
+
 static FSP_FILE_SYSTEM_INTERFACE VirtFsInterface =
 {
     .GetVolumeInfo = GetVolumeInfo,
@@ -1767,7 +1986,10 @@ static FSP_FILE_SYSTEM_INTERFACE VirtFsInterface =
     .Rename = Rename,
     .GetSecurity = GetSecurity,
     .SetSecurity = SetSecurity,
-    .ReadDirectory = ReadDirectory
+    .ReadDirectory = ReadDirectory,
+    .ResolveReparsePoints = ResolveReparsePoints,
+    .SetReparsePoint = SetReparsePoint,
+    .GetDirInfoByName = GetDirInfoByName
 };
 
 static ULONG wcstol_deflt(wchar_t *w, ULONG deflt)
@@ -1900,8 +2122,11 @@ static NTSTATUS SvcStart(FSP_SERVICE *Service, ULONG argc, PWSTR *argv)
     VolumeParams.CasePreservedNames = 1;
     VolumeParams.UnicodeOnDisk = 1;
     VolumeParams.PersistentAcls = 1;
+    VolumeParams.ReparsePoints = 1;
+    VolumeParams.ReparsePointsAccessCheck = 0;
     VolumeParams.PostCleanupWhenModifiedOnly = 1;
 //    VolumeParams.PassQueryDirectoryPattern = 1;
+    VolumeParams.PassQueryDirectoryFileName = 1;
     VolumeParams.FlushAndPurgeOnCleanup = 1;
     VolumeParams.UmFileContextIsUserContext2 = 1;
 //    VolumeParams.DirectoryMarkerAsNextOffset = 1;

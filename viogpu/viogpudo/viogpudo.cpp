@@ -41,7 +41,8 @@ static UINT g_InstanceId = 0;
 PAGED_CODE_SEG_BEGIN
 VioGpuDod::VioGpuDod(_In_ DEVICE_OBJECT* pPhysicalDeviceObject) : m_pPhysicalDevice(pPhysicalDeviceObject),
 m_MonitorPowerState(PowerDeviceD0),
-m_AdapterPowerState(PowerDeviceD0)
+m_AdapterPowerState(PowerDeviceD0),
+m_pHWDevice(NULL)
 {
     PAGED_CODE();
 
@@ -52,7 +53,6 @@ m_AdapterPowerState(PowerDeviceD0)
     RtlZeroMemory(&m_DeviceInfo, sizeof(m_DeviceInfo));
     RtlZeroMemory(m_CurrentModes, sizeof(m_CurrentModes));
     RtlZeroMemory(&m_PointerShape, sizeof(m_PointerShape));
-    m_pHWDevice = NULL;
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
 
@@ -87,11 +87,11 @@ BOOLEAN VioGpuDod::CheckHardware()
         DbgPrint(TRACE_LEVEL_ERROR, ("DxgkCbReadDeviceSpace failed with status 0x%X\n", Status));
         return FALSE;
     }
-
     DbgPrint(TRACE_LEVEL_INFORMATION, ("<--- %s VendorId = 0x%04X DeviceId = 0x%04X\n", __FUNCTION__, Header.VendorID, Header.DeviceID));
     if (Header.VendorID == REDHAT_PCI_VENDOR_ID &&
         Header.DeviceID == 0x1050)
     {
+        SetVgaDevice(Header.SubClass == PCI_SUBCLASS_VID_VGA_CTLR);
         return TRUE;
     }
 
@@ -134,6 +134,12 @@ NTSTATUS VioGpuDod::StartDevice(_In_  DXGK_START_INFO*   pDxgkStartInfo,
         return Status;
     }
 
+    Status = GetRegisterInfo();
+    if (!NT_SUCCESS(Status))
+    {
+        DbgPrint(TRACE_LEVEL_WARNING, ("GetRegisterInfo failed with status 0x%X\n", Status));
+    }
+
     Status = m_pHWDevice->HWInit(m_DeviceInfo.TranslatedResourceList, &m_CurrentModes[0].DispInfo);
     if (!NT_SUCCESS(Status))
     {
@@ -149,7 +155,7 @@ NTSTATUS VioGpuDod::StartDevice(_In_  DXGK_START_INFO*   pDxgkStartInfo,
         return Status;
     }
 
-    if (m_pHWDevice->IsPrimaryDevice())
+    if (IsVgaDevice())
     {
         Status = m_DxgkInterface.DxgkCbAcquirePostDisplayOwnership(m_DxgkInterface.DeviceHandle, &m_SystemDisplayInfo);
     }
@@ -421,14 +427,13 @@ NTSTATUS VioGpuDod::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO* pQuery
         pDriverCaps->WDDMVersion = DXGKDDI_WDDMv1_2;
         pDriverCaps->HighestAcceptableAddress.QuadPart = (ULONG64)-1;
 
-        if (m_pHWDevice->EnablePointer()) {
+        if (IsPointerEnabled()) {
             pDriverCaps->MaxPointerWidth = POINTER_SIZE;
             pDriverCaps->MaxPointerHeight = POINTER_SIZE;
-            pDriverCaps->PointerCaps.Monochrome = 0;
+            pDriverCaps->PointerCaps.Value = 0;
             pDriverCaps->PointerCaps.Color = 1;
-            pDriverCaps->PointerCaps.MaskedColor = 0;
         }
-        pDriverCaps->SupportNonVGA = m_pHWDevice->IsPrimaryDevice();
+        pDriverCaps->SupportNonVGA = IsVgaDevice();
         pDriverCaps->SupportSmoothRotation = TRUE;
         DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s 1\n", __FUNCTION__));
         return STATUS_SUCCESS;
@@ -450,7 +455,11 @@ NTSTATUS VioGpuDod::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION* pS
 
     VIOGPU_ASSERT(pSetPointerPosition != NULL);
     VIOGPU_ASSERT(pSetPointerPosition->VidPnSourceId < MAX_VIEWS);
-    return m_pHWDevice->SetPointerPosition(pSetPointerPosition, &m_CurrentModes[pSetPointerPosition->VidPnSourceId]);
+    if (IsPointerEnabled())
+    {
+        return m_pHWDevice->SetPointerPosition(pSetPointerPosition, &m_CurrentModes[pSetPointerPosition->VidPnSourceId]);
+    }
+    return STATUS_NOT_IMPLEMENTED;
 }
 
 NTSTATUS VioGpuDod::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE* pSetPointerShape)
@@ -460,8 +469,13 @@ NTSTATUS VioGpuDod::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE* pSetPoin
     VIOGPU_ASSERT(pSetPointerShape != NULL);
 
     DbgPrint(TRACE_LEVEL_INFORMATION, ("<---> %s Height = %d, Width = %d, XHot= %d, YHot = %d SourceId = %d\n",
-        __FUNCTION__, pSetPointerShape->Height, pSetPointerShape->Width, pSetPointerShape->XHot, pSetPointerShape->YHot, pSetPointerShape->VidPnSourceId));
-    return m_pHWDevice->SetPointerShape(pSetPointerShape, &m_CurrentModes[pSetPointerShape->VidPnSourceId]);
+        __FUNCTION__, pSetPointerShape->Height, pSetPointerShape->Width, pSetPointerShape->XHot, pSetPointerShape->YHot,
+        pSetPointerShape->VidPnSourceId));
+    if (IsPointerEnabled())
+    {
+        return m_pHWDevice->SetPointerShape(pSetPointerShape, &m_CurrentModes[pSetPointerShape->VidPnSourceId]);
+    }
+    return STATUS_NOT_IMPLEMENTED;
 }
 
 NTSTATUS VioGpuDod::PresentDisplayOnly(_In_ CONST DXGKARG_PRESENT_DISPLAYONLY* pPresentDisplayOnly)
@@ -1726,7 +1740,7 @@ NTSTATUS VioGpuDod::WriteRegistryString(_In_ HANDLE DevInstRegKeyHandle, _In_ PC
     return Status;
 }
 
-NTSTATUS VioGpuDod::WriteRegistryDWORD(_In_ HANDLE DevInstRegKeyHandle, _In_ PCWSTR pszwValueName, _In_ PDWORD pdwValue)
+NTSTATUS VioGpuDod::WriteRegistryDWORD(_In_ HANDLE DevInstRegKeyHandle, _In_ PCWSTR pszwValueName, _Inout_ PDWORD pdwValue)
 {
     PAGED_CODE();
 
@@ -1746,6 +1760,49 @@ NTSTATUS VioGpuDod::WriteRegistryDWORD(_In_ HANDLE DevInstRegKeyHandle, _In_ PCW
     if (!NT_SUCCESS(Status))
     {
         DbgPrint(TRACE_LEVEL_ERROR, ("ZwSetValueKey failed with Status: 0x%X\n", Status));
+    }
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+    return Status;
+}
+
+NTSTATUS VioGpuDod::ReadRegistryDWORD(_In_ HANDLE DevInstRegKeyHandle, _In_ PCWSTR pszwValueName, _Inout_ PDWORD pdwValue)
+{
+    PAGED_CODE();
+
+    NTSTATUS Status = STATUS_SUCCESS;
+    UNICODE_STRING UnicodeStrValueName;
+    ULONG ulRes;
+    UCHAR Buf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(DWORD)];
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    RtlInitUnicodeString(&UnicodeStrValueName, pszwValueName);
+
+    Status = ZwQueryValueKey(DevInstRegKeyHandle,
+        &UnicodeStrValueName,
+        KeyValuePartialInformation,
+        Buf,
+        sizeof(Buf),
+        &ulRes);
+
+    if (Status == STATUS_SUCCESS)
+    {
+        if (((PKEY_VALUE_PARTIAL_INFORMATION)Buf)->Type == REG_DWORD &&
+            (((PKEY_VALUE_PARTIAL_INFORMATION)Buf)->DataLength == sizeof(DWORD)))
+        {
+            ASSERT(Buf.Info.DataLength == sizeof(DWORD));
+            *pdwValue = *((PDWORD) &(((PKEY_VALUE_PARTIAL_INFORMATION)Buf)->Data));
+        }
+        else
+        {
+            Status = STATUS_INVALID_PARAMETER;
+            VioGpuDbgBreak();
+        }
+    }
+
+    if (!NT_SUCCESS(Status))
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("ZwQueryValueKey failed with Status: 0x%X\n", Status));
     }
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
@@ -1772,44 +1829,52 @@ NTSTATUS VioGpuDod::SetRegisterInfo(_In_ ULONG Id, DWORD MemSize)
         return Status;
     }
 
-    Status = WriteRegistryString(DevInstRegKeyHandle, L"HardwareInformation.ChipType", StrHWInfoChipType);
-    if (!NT_SUCCESS(Status))
-    {
-        DbgPrint(TRACE_LEVEL_ERROR, ("WriteRegistryString failed for PDO: 0x%p, Status: 0x%X", m_pPhysicalDevice, Status));
-        return Status;
-    }
+    do {
+        Status = WriteRegistryString(DevInstRegKeyHandle, L"HardwareInformation.ChipType", StrHWInfoChipType);
+        if (!NT_SUCCESS(Status))
+        {
+            DbgPrint(TRACE_LEVEL_ERROR, ("WriteRegistryString failed for ChipType with Status: 0x%X", Status));
+            break;
+        }
 
-    Status = WriteRegistryString(DevInstRegKeyHandle, L"HardwareInformation.DacType", StrHWInfoDacType);
-    if (!NT_SUCCESS(Status))
-    {
-        return Status;
-    }
+        Status = WriteRegistryString(DevInstRegKeyHandle, L"HardwareInformation.DacType", StrHWInfoDacType);
+        if (!NT_SUCCESS(Status))
+        {
+            DbgPrint(TRACE_LEVEL_ERROR, ("WriteRegistryString failed DacType with Status: 0x%X", Status));
+            break;
+        }
 
-    Status = WriteRegistryString(DevInstRegKeyHandle, L"HardwareInformation.AdapterString", StrHWInfoAdapterString);
-    if (!NT_SUCCESS(Status))
-    {
-        return Status;
-    }
+        Status = WriteRegistryString(DevInstRegKeyHandle, L"HardwareInformation.AdapterString", StrHWInfoAdapterString);
+        if (!NT_SUCCESS(Status))
+        {
+            DbgPrint(TRACE_LEVEL_ERROR, ("WriteRegistryString failed for AdapterString with Status: 0x%X", Status));
+            break;
+        }
 
-    Status = WriteRegistryString(DevInstRegKeyHandle, L"HardwareInformation.BiosString", StrHWInfoBiosString);
-    if (!NT_SUCCESS(Status))
-    {
-        return Status;
-    }
+        Status = WriteRegistryString(DevInstRegKeyHandle, L"HardwareInformation.BiosString", StrHWInfoBiosString);
+        if (!NT_SUCCESS(Status))
+        {
+            DbgPrint(TRACE_LEVEL_ERROR, ("WriteRegistryString failed for BiosString with Status: 0x%X", Status));
+            break;
+        }
 
-    DWORD MemorySize = MemSize;
-    Status = WriteRegistryDWORD(DevInstRegKeyHandle, L"HardwareInformation.MemorySize", &MemorySize);
-    if (!NT_SUCCESS(Status))
-    {
-        return Status;
-    }
+        DWORD MemorySize = MemSize;
+        Status = WriteRegistryDWORD(DevInstRegKeyHandle, L"HardwareInformation.MemorySize", &MemorySize);
+        if (!NT_SUCCESS(Status))
+        {
+            DbgPrint(TRACE_LEVEL_ERROR, ("WriteRegistryDWORD failed for MemorySize with Status: 0x%X", Status));
+            break;
+        }
 
-    DWORD DeviceId = Id;
-    Status = WriteRegistryDWORD(DevInstRegKeyHandle, L"VioGpuAdapterID", &DeviceId);
-    if (!NT_SUCCESS(Status))
-    {
-        return Status;
-    }
+        DWORD DeviceId = Id;
+        Status = WriteRegistryDWORD(DevInstRegKeyHandle, L"VioGpuAdapterID", &DeviceId);
+        if (!NT_SUCCESS(Status))
+        {
+            DbgPrint(TRACE_LEVEL_ERROR, ("WriteRegistryDWORD failed for VioGpuAdapterID with Status: 0x%X", Status));
+        }
+    } while (0);
+
+    ZwClose(DevInstRegKeyHandle);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
     return Status;
@@ -1822,14 +1887,21 @@ NTSTATUS VioGpuDod::GetRegisterInfo(void)
     NTSTATUS Status = STATUS_SUCCESS;
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
     HANDLE DevInstRegKeyHandle;
-    Status = IoOpenDeviceRegistryKey(m_pPhysicalDevice, PLUGPLAY_REGKEY_DRIVER, KEY_SET_VALUE, &DevInstRegKeyHandle);
+    Status = IoOpenDeviceRegistryKey(m_pPhysicalDevice, PLUGPLAY_REGKEY_DRIVER, KEY_READ, &DevInstRegKeyHandle);
     if (!NT_SUCCESS(Status))
     {
         DbgPrint(TRACE_LEVEL_ERROR, ("IoOpenDeviceRegistryKey failed for PDO: 0x%p, Status: 0x%X", m_pPhysicalDevice, Status));
         return Status;
     }
 
+    DWORD enabled = 0;
+    Status = ReadRegistryDWORD(DevInstRegKeyHandle, L"HWCursor", &enabled);
+    if (NT_SUCCESS(Status))
+    {
+        SetPointerEnabled(!!enabled);
+    }
 
+    ZwClose(DevInstRegKeyHandle);
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
     return Status;
 }
@@ -1865,9 +1937,7 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod* pVioGpuDod) : IVioGpuAdapter(pVioGp
     m_ModeCount = 0;
     m_ModeNumbers = NULL;
     m_CurrentMode = 0;
-    m_Id = g_InstanceId;
-    g_InstanceId++;
-    m_bPrimary = FALSE;
+    m_Id = g_InstanceId++;
     m_pFrameBuf = NULL;
     m_pCursorBuf = NULL;
     m_PendingWorks = 0;
@@ -1894,6 +1964,7 @@ VioGpuAdapter::~VioGpuAdapter(void)
     m_CustomMode = 0;
     m_ModeCount = 0;
     m_Id = 0;
+    g_InstanceId--;
     DbgPrint(TRACE_LEVEL_FATAL, ("<--- %s\n", __FUNCTION__));
 }
 
@@ -2192,7 +2263,6 @@ NTSTATUS VioGpuAdapter::HWInit(PCM_RESOURCE_LIST pResList, DXGK_DISPLAY_INFORMAT
     req_size = max(0x800000, req_size);
 
     if (fb_pa.QuadPart != 0LL) {
-        m_bPrimary = TRUE;
         pDispInfo->PhysicAddress = fb_pa;
     }
 
