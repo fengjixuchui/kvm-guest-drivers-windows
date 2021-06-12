@@ -137,10 +137,18 @@ VOID ParaNdis_SetLinkState(PARANDIS_ADAPTER *pContext, NDIS_MEDIA_CONNECT_STATE 
     }
 }
 
-VOID ParaNdis_SynchronizeLinkState(PARANDIS_ADAPTER *pContext)
+VOID ParaNdis_SynchronizeLinkState(PARANDIS_ADAPTER *pContext, bool bReport)
 {
-    ParaNdis_SetLinkState(pContext, pContext->bConnected ? MediaConnectStateConnected
-                                                         : MediaConnectStateDisconnected);
+    BOOLEAN connected = pContext->bConnected && !pContext->bSuppressLinkUp;
+    NDIS_MEDIA_CONNECT_STATE state = connected ? MediaConnectStateConnected : MediaConnectStateDisconnected;
+    if (bReport)
+    {
+        ParaNdis_SetLinkState(pContext, state);
+    }
+    else
+    {
+        pContext->fCurrentLinkState = state;
+    }
 }
 
 VOID ParaNdis_SendGratuitousArpPacket(PARANDIS_ADAPTER *pContext)
@@ -256,13 +264,21 @@ static NDIS_STATUS ParaNdis6_Initialize(
         miniportAttributes.GeneralAttributes.LookaheadSize = pContext->MaxPacketSize.nMaxFullSizeOS;
         miniportAttributes.GeneralAttributes.MaxXmitLinkSpeed =
         miniportAttributes.GeneralAttributes.MaxRcvLinkSpeed  = pContext->LinkProperties.Speed;
-        miniportAttributes.GeneralAttributes.MediaConnectState =
-            pContext->bConnected ? MediaConnectStateConnected : MediaConnectStateDisconnected;
-        miniportAttributes.GeneralAttributes.XmitLinkSpeed =
-        miniportAttributes.GeneralAttributes.RcvLinkSpeed = pContext->bConnected ?
-            pContext->LinkProperties.Speed : NDIS_LINK_SPEED_UNKNOWN;
-        miniportAttributes.GeneralAttributes.MediaDuplexState = pContext->bConnected ?
-            pContext->LinkProperties.DuplexState : MediaDuplexStateUnknown;
+        miniportAttributes.GeneralAttributes.MediaConnectState = pContext->fCurrentLinkState;
+        if (pContext->fCurrentLinkState == MediaConnectStateConnected)
+        {
+            miniportAttributes.GeneralAttributes.XmitLinkSpeed =
+                miniportAttributes.GeneralAttributes.RcvLinkSpeed = pContext->LinkProperties.Speed;
+            miniportAttributes.GeneralAttributes.MediaDuplexState = pContext->LinkProperties.DuplexState;
+            DPrintf(0, "[%s] Initially connected @%d Mbps\n", __FUNCTION__, (ULONG)(pContext->LinkProperties.Speed / 1000000));
+        }
+        else
+        {
+            miniportAttributes.GeneralAttributes.XmitLinkSpeed =
+                miniportAttributes.GeneralAttributes.RcvLinkSpeed = NDIS_LINK_SPEED_UNKNOWN;
+            miniportAttributes.GeneralAttributes.MediaDuplexState = MediaDuplexStateUnknown;
+            DPrintf(0, "[%s] Initially not connected\n", __FUNCTION__);
+        }
         miniportAttributes.GeneralAttributes.MacOptions =
                     NDIS_MAC_OPTION_COPY_LOOKAHEAD_DATA |       /* NIC has no internal loopback support */
                     NDIS_MAC_OPTION_TRANSFERS_NOT_PEND  |       /* Must be set since using  NdisMIndicateReceivePacket */
@@ -544,6 +560,7 @@ static NDIS_STATUS ParaNdis6_Reset(
         PBOOLEAN  pAddressingReset)
 {
     PARANDIS_ADAPTER *pContext = (PARANDIS_ADAPTER *)miniportAdapterContext;
+    DEBUG_ENTRY(0);
     ParaNdis_PowerOff(pContext);
     ParaNdis_PowerOn(pContext);
     *pAddressingReset = FALSE;

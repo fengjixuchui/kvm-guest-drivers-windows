@@ -42,7 +42,9 @@ typedef struct
     UINT HardwareInit : 1;
     UINT PointerEnabled : 1;
     UINT VgaDevice : 1;
-    UINT Unused : 28;
+    UINT FlexResolution : 1;
+    UINT UsePhysicalMemory : 1;
+    UINT Unused : 26;
 } DRIVER_STATUS_FLAG;
 
 #pragma pack(pop)
@@ -108,6 +110,7 @@ public:
     virtual VOID BlackOutScreen(CURRENT_MODE* pCurrentMod) = 0;
     virtual NTSTATUS SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE* pSetPointerShape, _In_ CONST CURRENT_MODE* pModeCur) = 0;
     virtual NTSTATUS SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION* pSetPointerPosition, _In_ CONST CURRENT_MODE* pModeCur) = 0;
+    virtual NTSTATUS Escape(_In_ CONST DXGKARG_ESCAPE* pEscap) = 0;
     ULONG GetInstanceId(void) { return m_Id; }
     VioGpuDod* GetVioGpu(void) { return m_pVioGpuDod; }
     virtual PBYTE GetEdidData(UINT Idx) = 0;
@@ -154,6 +157,7 @@ public:
     VOID ResetDevice(VOID);
     NTSTATUS SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE* pSetPointerShape, _In_ CONST CURRENT_MODE* pModeCur);
     NTSTATUS SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION* pSetPointerPosition, _In_ CONST CURRENT_MODE* pModeCur);
+    NTSTATUS Escape(_In_ CONST DXGKARG_ESCAPE* pEscap);
     CPciResources* GetPciResources(void) { return &m_PciResources; }
     BOOLEAN IsMSIEnabled() { return m_PciResources.IsMSIEnabled(); }
     PHYSICAL_ADDRESS GetFrameBufferPA(void) { return  m_PciResources.GetPciBar(0)->GetPA(); }
@@ -161,7 +165,7 @@ public:
 protected:
 private:
     NTSTATUS VioGpuAdapterInit(DXGK_DISPLAY_INFORMATION* pDispInfo);
-    void SetVideoModeInfo(UINT Idx, PGPU_DISP_MODE pModeInfo);
+    void SetVideoModeInfo(UINT Idx, PVIOGPU_DISP_MODE pModeInfo);
     void VioGpuAdapterClose(void);
     NTSTATUS GetModeList(DXGK_DISPLAY_INFORMATION* pDispInfo);
     BOOLEAN AckFeature(UINT64 Feature);
@@ -183,7 +187,9 @@ private:
     void ConfigChanged(void);
     NTSTATUS VirtIoDeviceInit(void);
     PBYTE GetEdidData(UINT Idx);
-
+    VOID CreateResolutionEvent(VOID);
+    VOID NotifyResolutionEvent(VOID);
+    VOID CloseResolutionEvent(VOID);
 private:
     VirtIODevice m_VioDev;
     CPciResources m_PciResources;
@@ -203,6 +209,8 @@ private:
     KEVENT m_ConfigUpdateEvent;
     PETHREAD m_pWorkThread;
     BOOLEAN m_bStopWorkThread;
+    PKEVENT m_ResolutionEvent;
+    HANDLE m_ResolutionEventHandle;
 };
 
 class VioGpuDod {
@@ -255,6 +263,22 @@ public:
     {
         m_Flags.VgaDevice = Vga;
     }
+    BOOLEAN IsFlexResolution(void) const
+    {
+        return m_Flags.FlexResolution;
+    }
+    void SetFlexResolution(BOOLEAN FlexRes)
+    {
+        m_Flags.FlexResolution = FlexRes;
+    }
+    BOOLEAN IsUsePhysicalMemory() const
+    {
+        return m_Flags.UsePhysicalMemory;
+    }
+    void SetUsePhysicalMemory(BOOLEAN enable)
+    {
+        m_Flags.UsePhysicalMemory = enable;
+    }
 #pragma code_seg(pop)
 
     NTSTATUS StartDevice(_In_  DXGK_START_INFO*   pDxgkStartInfo,
@@ -279,6 +303,7 @@ public:
     NTSTATUS QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO* pQueryAdapterInfo);
     NTSTATUS SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION* pSetPointerPosition);
     NTSTATUS SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE* pSetPointerShape);
+    NTSTATUS Escape(_In_ CONST DXGKARG_ESCAPE* pEscape);
     NTSTATUS PresentDisplayOnly(_In_ CONST DXGKARG_PRESENT_DISPLAYONLY* pPresentDisplayOnly);
     NTSTATUS QueryInterface(_In_ CONST PQUERY_INTERFACE     QueryInterface);
     NTSTATUS IsSupportedVidPn(_Inout_ DXGKARG_ISSUPPORTEDVIDPN* pIsSupportedVidPn);

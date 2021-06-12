@@ -407,6 +407,7 @@ struct _PARANDIS_ADAPTER : public CNdisAllocatable<_PARANDIS_ADAPTER, 'DCTX'>
     u64                     u64HostFeatures = 0;
     u64                     u64GuestFeatures = 0;
     BOOLEAN                 bConnected = false;
+    BOOLEAN                 bSuppressLinkUp = false;
     BOOLEAN                 bGuestAnnounced = false;
     NDIS_PHYSICAL_MEDIUM    physicalMediaType;
     NDIS_MEDIA_CONNECT_STATE fCurrentLinkState;
@@ -712,7 +713,8 @@ VOID ParaNdis_DeviceFiltersUpdateVlanId(
     PARANDIS_ADAPTER *pContext);
 
 VOID ParaNdis_SynchronizeLinkState(
-    PARANDIS_ADAPTER *pContext);
+    PARANDIS_ADAPTER *pContext,
+    bool bReport = true);
 
 VOID ParaNdis_SendGratuitousArpPacket(
     PARANDIS_ADAPTER *pContext);
@@ -829,7 +831,7 @@ tTcpIpPacketParsingResult ParaNdis_ReviewIPPacket(PVOID buffer, ULONG size, BOOL
 BOOLEAN ParaNdis_AnalyzeReceivedPacket(PVOID headersBuffer, ULONG dataLength, PNET_PACKET_INFO packetInfo);
 ULONG ParaNdis_StripVlanHeaderMoveHead(PNET_PACKET_INFO packetInfo);
 VOID ParaNdis_PadPacketToMinimalLength(PNET_PACKET_INFO packetInfo);
-BOOLEAN ParaNdis_IsSendPossible(PARANDIS_ADAPTER *pContext);
+BOOLEAN ParaNdis_IsTxRxPossible(PARANDIS_ADAPTER *pContext);
 NDIS_STATUS ParaNdis_ExactSendFailureStatus(PARANDIS_ADAPTER *pContext);
 
 VOID ParaNdis_PropagateOid(PARANDIS_ADAPTER *pContext, NDIS_OID oid, PVOID buffer, UINT length);

@@ -323,8 +323,8 @@ public:
     // when VFIO adapter enters operational state
     void OnAdapterAttached()
     {
+        ULONG waitTime = 100; //ms
         TraceNoPrefix(0, "[%s] %p\n", __FUNCTION__, m_BoundAdapter);
-        SetOid(OID_GEN_CURRENT_PACKET_FILTER, &m_BoundAdapter->PacketFilter, sizeof(m_BoundAdapter->PacketFilter));
         if (m_BoundAdapter->MulticastData.nofMulticastEntries)
         {
             SetOid(OID_802_3_MULTICAST_LIST, m_BoundAdapter->MulticastData.MulticastList,
@@ -340,7 +340,14 @@ public:
 
         m_TxStateMachine.Start();
         m_RxStateMachine.Start();
+
+        TraceNoPrefix(0, "[%s] Wait %d ms until the adapter finally restarted\n", __FUNCTION__, waitTime);
+        NdisMSleep(waitTime * 1000);
+
+        m_BoundAdapter->bSuppressLinkUp = false;
+        ParaNdis_SynchronizeLinkState(m_BoundAdapter);
         m_Started = true;
+        SetOid(OID_GEN_CURRENT_PACKET_FILTER, &m_BoundAdapter->PacketFilter, sizeof(m_BoundAdapter->PacketFilter));
     }
     // called under protocol mutex
     // when netkvm adapter comes and binding present
@@ -709,11 +716,19 @@ public:
         {
             if (e->MatchMac(pContext->CurrentMacAddress))
             {
-                TraceNoPrefix(0, "[%s] found entry %p for adapter %p\n", func, e, pContext);
-                e->m_Adapter = pContext;
-                e->NotifyAdapterArrival();
-                Done = true;
-                return false;
+                if (!e->m_Adapter)
+                {
+                    TraceNoPrefix(0, "[%s] found entry %p for adapter %p\n", func, e, pContext);
+                    e->m_Adapter = pContext;
+                    e->NotifyAdapterArrival();
+                    Done = true;
+                    return false;
+                }
+                else
+                {
+                    TraceNoPrefix(0, "[%s] duplicated MAC entry %p for adapter %p, existing %p\n",
+                        func, e, pContext, e->m_Adapter);
+                }
             }
             return true;
         });
@@ -759,7 +774,7 @@ public:
         {
             if (e->m_Adapter)
             {
-                TraceNoPrefix(0, "[%s] existing entry %p for adapter %p\n", func, e, pContext);
+                TraceNoPrefix(0, "[%s] still present entry %p for adapter %p\n", func, e, e->m_Adapter);
                 bNoMore = false;
             }
         });
@@ -768,6 +783,23 @@ public:
             TraceNoPrefix(0, "[%s] no more adapters\n", func);
         }
         return bNoMore;
+    }
+    bool FindAdapterPdo(PDEVICE_OBJECT Pdo)
+    {
+        bool found = false;
+        m_Adapters.ForEach([&](CAdapterEntry *e)
+        {
+            if (e->m_Adapter) {
+                PDEVICE_OBJECT pdo = NULL;
+                NdisMGetDeviceProperty(e->m_Adapter->MiniportHandle, &pdo, NULL, NULL, NULL, NULL);
+                if (pdo == Pdo) {
+                    found = true;
+                    return false;
+                }
+            }
+            return true;
+        });
+        return found;
     }
     void AddBinding(UCHAR *MacAddress, PVOID Binding)
     {
@@ -780,6 +812,12 @@ public:
         {
             if (!e->MatchMac(MacAddress)) {
                 return true;
+            }
+            if (e->m_Binding) {
+                TraceNoPrefix(0, "[%s] already present binding %p with adapter %p\n",
+                    func, e->m_Binding, e->m_Adapter);
+                Done = true;
+                return false;
             }
             e->m_Binding = Binding;
             e->NotifyAdapterArrival();
@@ -874,6 +912,12 @@ NDIS_STATUS CProtocolBinding::Bind(PNDIS_BIND_PARAMETERS BindParameters)
     AddRef();
 
     m_Pdo = BindParameters->PhysicalDeviceObject;
+    if (m_Protocol.FindAdapterPdo(m_Pdo))
+    {
+        TraceNoPrefix(0, "[%s] rejected binding to NETKVM instance\n", __FUNCTION__);
+        Unbind(m_BindContext);
+        return NDIS_STATUS_NOT_SUPPORTED;
+    }
 
     openParams.Header.Type = NDIS_OBJECT_TYPE_OPEN_PARAMETERS;
     openParams.Header.Revision = NDIS_OPEN_PARAMETERS_REVISION_1;
@@ -902,15 +946,17 @@ NDIS_STATUS CProtocolBinding::Bind(PNDIS_BIND_PARAMETERS BindParameters)
         TraceNoPrefix(0, "[%s] %p, failed %X\n", __FUNCTION__, this, status);
         Unbind(m_BindContext);
     }
-
-    QueryCapabilities(BindParameters);
-    QueryCurrentOffload();
-    QueryCurrentRSS();
-
-    if (NT_SUCCESS(status))
+    else
     {
+        ULONG val = 0;
+        // make the VF silent
+        SetOid(OID_GEN_CURRENT_PACKET_FILTER, &val, sizeof(val));
+        QueryCapabilities(BindParameters);
+        QueryCurrentOffload();
+        QueryCurrentRSS();
         m_Protocol.AddBinding(BindParameters->CurrentMacAddress, this);
     }
+
     Release();
 
     return status;
@@ -1161,6 +1207,7 @@ void CProtocolBinding::OnSendCompletion(PNET_BUFFER_LIST Nbls, ULONG Flags)
     PNET_BUFFER_LIST *pCurrent = &Nbls;
     PNET_BUFFER_LIST current = Nbls;
     ULONG errors = 0, count = 0;
+    int level;
 
     RetrieveSourceHandle(Nbls);
 
@@ -1186,7 +1233,8 @@ void CProtocolBinding::OnSendCompletion(PNET_BUFFER_LIST Nbls, ULONG Flags)
         current = *pCurrent;
     }
 
-    TraceNoPrefix(errors != 0 ? 0 : 1, "[%s] %d nbls(%d errors)\n", __FUNCTION__, count, errors);
+    level = errors ? 0 : 1;
+    TraceNoPrefix(level, "[%s] %d nbls(%d errors)\n", __FUNCTION__, count, errors);
 
     if (Nbls)
     {
@@ -1198,6 +1246,11 @@ void CProtocolBinding::OnSendCompletion(PNET_BUFFER_LIST Nbls, ULONG Flags)
 void CAdapterEntry::Notifier(PVOID Binding, NotifyEvent Event, PARANDIS_ADAPTER *Adapter)
 {
     CProtocolBinding *pb = (CProtocolBinding *)Binding;
+    if (!pb)
+    {
+        TraceNoPrefix(0, "[%s] No binding present, skip the notification\n", __FUNCTION__);
+        return;
+    }
     switch (Event)
     {
         case Arrival:

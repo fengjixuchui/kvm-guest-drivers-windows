@@ -60,7 +60,10 @@ VioGpuQueue::~VioGpuQueue()
 
 void VioGpuQueue::Close(void)
 {
+    KIRQL SavedIrql;
+    Lock(&SavedIrql);
     m_pVirtQueue = NULL;
+    Unlock(SavedIrql);
 }
 
 BOOLEAN  VioGpuQueue::Init(
@@ -562,9 +565,8 @@ UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf)
 
     Lock(&SavedIrql);
     ret = AddBuf(&sg[0], outcnt, incnt, buf, NULL, 0);
-    Unlock(SavedIrql);
-
     Kick();
+    Unlock(SavedIrql);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s ret = %d\n", __FUNCTION__, ret));
 
@@ -840,28 +842,25 @@ BOOLEAN VioGpuMemSegment::Init(_In_ UINT size, _In_ PPHYSICAL_ADDRESS pPAddr)
     UINT sglsize = sizeof(SCATTER_GATHER_LIST) + (sizeof(SCATTER_GATHER_ELEMENT) * pages);
     size = pages * PAGE_SIZE;
 
-    if (pPAddr == NULL) {
+    if ((pPAddr == NULL) ||
+        pPAddr->QuadPart == 0LL) {
         m_pVAddr = new (NonPagedPoolNx) BYTE[size];
-        RtlZeroMemory(m_pVAddr, size);
 
         if (!m_pVAddr)
         {
             DbgPrint(TRACE_LEVEL_FATAL, ("%s insufficient resources to allocate %x bytes\n", __FUNCTION__, size));
             return FALSE;
         }
+        RtlZeroMemory(m_pVAddr, size);
         m_bSystemMemory = TRUE;
     }
-    else if (pPAddr->QuadPart) {
+    else {
         NTSTATUS Status = MapFrameBuffer(*pPAddr, size, &m_pVAddr);
         if (!NT_SUCCESS(Status)) {
             DbgPrint(TRACE_LEVEL_FATAL, ("<--- %s MapFrameBuffer failed with Status: 0x%X\n", __FUNCTION__, Status));
             return FALSE;
         }
         m_bMapped = TRUE;
-    }
-    else {
-        DbgPrint(TRACE_LEVEL_FATAL, ("<--- %s Invalid address\n", __FUNCTION__));
-        return FALSE;
     }
 
     m_pMdl = IoAllocateMdl(m_pVAddr, size, FALSE, FALSE, NULL);
@@ -1043,8 +1042,8 @@ UINT CrsrQueue::QueueCursor(PGPU_VBUFFER buf)
     ASSERT(outcnt);
     Lock(&SavedIrql);
     ret = AddBuf(&sg[0], outcnt, 0, buf, NULL, 0);
-    Unlock(SavedIrql);
     Kick();
+    Unlock(SavedIrql);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s vbuf = %p outcnt = %d, ret = %d\n", __FUNCTION__, buf, outcnt, ret));
     return res;

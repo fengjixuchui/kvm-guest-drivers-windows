@@ -383,6 +383,7 @@ static void DumpVirtIOFeatures(PPARANDIS_ADAPTER pContext)
 
         {VIRTIO_NET_F_CSUM, "VIRTIO_NET_F_CSUM" },
         {VIRTIO_NET_F_GUEST_CSUM, "VIRTIO_NET_F_GUEST_CSUM" },
+        {VIRTIO_NET_F_MTU, "VIRTIO_NET_F_MTU" },
         {VIRTIO_NET_F_MAC, "VIRTIO_NET_F_MAC" },
         {VIRTIO_NET_F_GSO, "VIRTIO_NET_F_GSO" },
         {VIRTIO_NET_F_GUEST_TSO4, "VIRTIO_NET_F_GUEST_TSO4"},
@@ -399,6 +400,7 @@ static void DumpVirtIOFeatures(PPARANDIS_ADAPTER pContext)
         {VIRTIO_NET_F_CTRL_RX, "VIRTIO_NET_F_CTRL_RX"},
         {VIRTIO_NET_F_CTRL_VLAN, "VIRTIO_NET_F_CTRL_VLAN"},
         {VIRTIO_NET_F_CTRL_RX_EXTRA, "VIRTIO_NET_F_CTRL_RX_EXTRA"},
+        {VIRTIO_NET_F_GUEST_ANNOUNCE, "VIRTIO_NET_F_GUEST_ANNOUNCE"},
         {VIRTIO_NET_F_CTRL_MAC_ADDR, "VIRTIO_NET_F_CTRL_MAC_ADDR"},
         {VIRTIO_NET_F_MQ, "VIRTIO_NET_F_MQ"},
         {VIRTIO_RING_F_INDIRECT_DESC, "VIRTIO_RING_F_INDIRECT_DESC"},
@@ -406,6 +408,7 @@ static void DumpVirtIOFeatures(PPARANDIS_ADAPTER pContext)
         {VIRTIO_RING_F_EVENT_IDX, "VIRTIO_RING_F_EVENT_IDX"},
         {VIRTIO_F_VERSION_1, "VIRTIO_F_VERSION_1"},
         {VIRTIO_F_RING_PACKED, "VIRTIO_F_RING_PACKED"},
+        {VIRTIO_F_ACCESS_PLATFORM, "VIRTIO_F_ACCESS_PLATFORM"},
         {VIRTIO_NET_F_CTRL_GUEST_OFFLOADS, "VIRTIO_NET_F_CTRL_GUEST_OFFLOADS" },
         {VIRTIO_NET_F_RSC_EXT, "VIRTIO_NET_F_RSC_EXT" },
         {VIRTIO_NET_F_RSS, "VIRTIO_NET_F_RSS" },
@@ -707,6 +710,21 @@ static NDIS_STATUS NTStatusToNdisStatus(NTSTATUS nt_status) {
     }
 }
 
+static void ReadLinkState(PARANDIS_ADAPTER *pContext)
+{
+    if (pContext->bLinkDetectSupported)
+    {
+        USHORT linkStatus = 0;
+        virtio_get_config(&pContext->IODevice, ETH_ALEN, &linkStatus, sizeof(linkStatus));
+        pContext->bConnected = !!(linkStatus & VIRTIO_NET_S_LINK_UP);
+        pContext->bGuestAnnounced = !!(linkStatus & VIRTIO_NET_S_ANNOUNCE);
+    }
+    else
+    {
+        pContext->bConnected = TRUE;
+    }
+}
+
 /**********************************************************
 Initializes the context structure
 Major variables, received from NDIS on initialization, must be be set before this call
@@ -724,7 +742,6 @@ NDIS_STATUS ParaNdis_InitializeContext(
     PNDIS_RESOURCE_LIST pResourceList)
 {
     NDIS_STATUS status = NDIS_STATUS_SUCCESS;
-    USHORT linkStatus = 0;
     UCHAR CurrentMAC[ETH_ALEN] = {0};
     ULONG dependentOptions;
 
@@ -771,18 +788,13 @@ NDIS_STATUS ParaNdis_InitializeContext(
 #if (WINVER == 0x0A00)
         AckFeature(pContext, VIRTIO_F_ACCESS_PLATFORM);
 #endif
-        AckFeature(pContext, VIRTIO_NET_F_STANDBY);
+        pContext->bSuppressLinkUp = AckFeature(pContext, VIRTIO_NET_F_STANDBY);
 
         pContext->bLinkDetectSupported = AckFeature(pContext, VIRTIO_NET_F_STATUS);
-        if(pContext->bLinkDetectSupported) {
-            virtio_get_config(&pContext->IODevice, ETH_ALEN, &linkStatus, sizeof(linkStatus));
-            pContext->bConnected = (linkStatus & VIRTIO_NET_S_LINK_UP) != 0;
-            DPrintf(0, "[%s] Link status on driver startup: %d\n", __FUNCTION__, pContext->bConnected);
-        }
-        else
-        {
-            pContext->bConnected = TRUE;
-        }
+        ReadLinkState(pContext);
+        DPrintf(0, "[%s] Link status on driver startup: %d\n", __FUNCTION__, pContext->bConnected);
+        pContext->bGuestAnnounced = false;
+        ParaNdis_SynchronizeLinkState(pContext, false);
 
         InitializeLinkPropertiesConfig(pContext);
         pContext->bControlQueueSupported = AckFeature(pContext, VIRTIO_NET_F_CTRL_VQ);
@@ -1092,21 +1104,6 @@ static NDIS_STATUS ParaNdis_VirtIONetInit(PARANDIS_ADAPTER *pContext)
     status = NDIS_STATUS_SUCCESS;
 
     return status;
-}
-
-static void ReadLinkState(PARANDIS_ADAPTER *pContext)
-{
-    if (pContext->bLinkDetectSupported)
-    {
-        USHORT linkStatus = 0;
-        virtio_get_config(&pContext->IODevice, ETH_ALEN, &linkStatus, sizeof(linkStatus));
-        pContext->bConnected = !!(linkStatus & VIRTIO_NET_S_LINK_UP);
-        pContext->bGuestAnnounced = !!(linkStatus & VIRTIO_NET_S_ANNOUNCE);
-    }
-    else
-    {
-        pContext->bConnected = TRUE;
-    }
 }
 
 static UINT8 ReadDeviceStatus(PARANDIS_ADAPTER *pContext)
@@ -1546,9 +1543,7 @@ static void ProcessReceiveQueue(PARANDIS_ADAPTER *pContext,
     {
         PNET_PACKET_INFO pPacketInfo = &pBufferDescriptor->PacketInfo;
 
-        if( !pContext->bSurprizeRemoved &&
-            pContext->bConnected &&
-            ShallPassPacket(pContext, pPacketInfo))
+        if(ParaNdis_IsTxRxPossible(pContext) && ShallPassPacket(pContext, pPacketInfo))
         {
             UINT nCoalescedSegmentsCount;
             PNET_BUFFER_LIST packet = ParaNdis_PrepareReceivedPacket(pContext, pBufferDescriptor, &nCoalescedSegmentsCount);
